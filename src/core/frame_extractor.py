@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import importlib
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 from typing import Callable, Iterable
@@ -234,6 +236,97 @@ def _extract_with_imageio_fallback(
     )
 
 
+def _jpg_quality_to_ffmpeg_qscale(jpg_quality: int) -> int:
+    # ffmpeg jpg quality uses 2(best)-31(worst), inverse of 1-100 slider.
+    q = max(1, min(100, int(jpg_quality)))
+    return int(round(((100 - q) / 99) * 29 + 2))
+
+
+def _extract_with_ffmpeg_recovery(
+    video_path: Path,
+    output_dir: Path,
+    interval: int,
+    image_format: ImageFormat,
+    jpg_quality: int,
+    progress_cb: ProgressCallback | None,
+) -> VideoExtractionResult:
+    ext = ".jpg" if image_format == ImageFormat.JPG else ".png"
+    tmp_dir = output_dir / "__ffmpeg_recovery_tmp"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    pattern_path = tmp_dir / f"frame_%06d{ext}"
+
+    try:
+        imageio_ffmpeg = importlib.import_module("imageio_ffmpeg")
+        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception as exc:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        return VideoExtractionResult(
+            video_path=video_path,
+            output_dir=output_dir,
+            saved_count=0,
+            total_frames_seen=0,
+            success=False,
+            message=f"Recovery backend is unavailable: {exc}",
+        )
+
+    cmd: list[str] = [
+        str(ffmpeg_exe),
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-err_detect",
+        "ignore_err",
+        "-fflags",
+        "+genpts+igndts+discardcorrupt",
+        "-analyzeduration",
+        "200M",
+        "-probesize",
+        "200M",
+        "-i",
+        str(video_path),
+        "-vf",
+        f"select=not(mod(n\\,{interval}))",
+        "-vsync",
+        "vfr",
+    ]
+    if image_format == ImageFormat.JPG:
+        cmd.extend(["-q:v", str(_jpg_quality_to_ffmpeg_qscale(jpg_quality))])
+    cmd.extend(["-y", str(pattern_path)])
+
+    run = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="ignore")
+
+    extracted = sorted(tmp_dir.glob(f"frame_*{ext}"))
+    if not extracted:
+        stderr = (run.stderr or "").strip()
+        stdout = (run.stdout or "").strip()
+        details = stderr or stdout or f"ffmpeg return code {run.returncode}"
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        return VideoExtractionResult(
+            video_path=video_path,
+            output_dir=output_dir,
+            saved_count=0,
+            total_frames_seen=0,
+            success=False,
+            message=f"Recovery decoder failed: {details}",
+        )
+
+    for idx, src_path in enumerate(extracted):
+        dst_path = output_dir / f"{video_path.stem}_{idx:06d}{ext}"
+        src_path.replace(dst_path)
+        if progress_cb and (idx + 1) % 25 == 0:
+            progress_cb(f"[recovery] Saved {idx + 1} frames from {video_path.name}")
+
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+    return VideoExtractionResult(
+        video_path=video_path,
+        output_dir=output_dir,
+        saved_count=len(extracted),
+        total_frames_seen=-1,
+        success=True,
+        message="Completed with recovery ffmpeg decoder.",
+    )
+
+
 def extract_video_frames(
     video_path: Path,
     options: ExtractionOptions,
@@ -261,13 +354,37 @@ def extract_video_frames(
 
     if progress_cb:
         progress_cb(f"[fallback] OpenCV decode failed for {video_path.name}. Trying ffmpeg backend.")
-    return _extract_with_imageio_fallback(
+    imageio_result = _extract_with_imageio_fallback(
         video_path=video_path,
         output_dir=output_dir,
         interval=interval,
         image_format=image_format,
         jpg_quality=jpg_quality,
         progress_cb=progress_cb,
+    )
+    if imageio_result.success:
+        return imageio_result
+
+    if progress_cb:
+        progress_cb(f"[recovery] Trying tolerant ffmpeg recovery for {video_path.name}.")
+    recovery_result = _extract_with_ffmpeg_recovery(
+        video_path=video_path,
+        output_dir=output_dir,
+        interval=interval,
+        image_format=image_format,
+        jpg_quality=jpg_quality,
+        progress_cb=progress_cb,
+    )
+    if recovery_result.success:
+        return recovery_result
+
+    return VideoExtractionResult(
+        video_path=video_path,
+        output_dir=output_dir,
+        saved_count=0,
+        total_frames_seen=0,
+        success=False,
+        message=f"{imageio_result.message}\n\n{recovery_result.message}",
     )
 
 

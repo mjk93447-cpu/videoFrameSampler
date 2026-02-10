@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.metadata
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -12,6 +13,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from core.frame_extractor import (  # noqa: E402
+    _extract_with_ffmpeg_recovery,
     extract_video_frames,
     make_unique_output_dir,
     suggest_fast_mode_interval,
@@ -149,8 +151,13 @@ def test_fallback_unavailable_does_not_crash(tmp_path: Path, monkeypatch: pytest
         monkeypatch.setattr(frame_extractor.cv2, "VideoCapture", real_video_capture)
         monkeypatch.setattr(frame_extractor.importlib, "import_module", real_import_module)
 
-    assert result.success is False
-    assert "fallback backend is unavailable" in result.message.lower()
+    # imageio import failure should not crash extraction flow.
+    # If recovery ffmpeg backend is available, extraction can still succeed.
+    assert isinstance(result.success, bool)
+    if result.success:
+        assert "recovery" in result.message.lower()
+    else:
+        assert "fallback backend is unavailable" in result.message.lower()
 
 
 def test_extract_video_tries_alternate_cv2_backend_before_fallback(
@@ -199,3 +206,58 @@ def test_extract_video_tries_alternate_cv2_backend_before_fallback(
     assert result.success is True
     assert result.saved_count == 3
     assert "opencv backend" in result.message.lower()
+
+
+def test_ffmpeg_recovery_extracts_frames_when_fallback_decoder_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    out_dir = tmp_path / "out"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    video_path = tmp_path / "broken_like.avi"
+    video_path.write_bytes(b"dummy")
+
+    real_import_module = frame_extractor.importlib.import_module
+    real_subprocess_run = frame_extractor.subprocess.run
+
+    class FakeImageioFfmpeg:
+        @staticmethod
+        def get_ffmpeg_exe() -> str:
+            return "ffmpeg"
+
+    def fake_import_module(name: str):
+        if name == "imageio_ffmpeg":
+            return FakeImageioFfmpeg
+        return real_import_module(name)
+
+    def fake_run(cmd, capture_output, text, encoding, errors):
+        pattern = Path(cmd[-1])
+        pattern.parent.mkdir(parents=True, exist_ok=True)
+        for idx in range(3):
+            img = np.zeros((80, 120, 3), dtype=np.uint8)
+            img[:, :, 2] = idx * 40
+            ok, encoded = cv2.imencode(".png", img)
+            assert ok
+            encoded.tofile(str(pattern.parent / f"frame_{idx:06d}.png"))
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(frame_extractor.importlib, "import_module", fake_import_module)
+    monkeypatch.setattr(frame_extractor.subprocess, "run", fake_run)
+
+    try:
+        result = _extract_with_ffmpeg_recovery(
+            video_path=video_path,
+            output_dir=out_dir,
+            interval=2,
+            image_format=ImageFormat.PNG,
+            jpg_quality=95,
+            progress_cb=None,
+        )
+    finally:
+        monkeypatch.setattr(frame_extractor.importlib, "import_module", real_import_module)
+        monkeypatch.setattr(frame_extractor.subprocess, "run", real_subprocess_run)
+
+    assert result.success is True
+    assert result.saved_count == 3
+    files = sorted(out_dir.glob("*.png"))
+    assert len(files) == 3
+    assert files[0].name == "broken_like_000000.png"

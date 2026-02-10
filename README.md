@@ -43,6 +43,12 @@ python -m pytest -q
 python tests/generate_test_video.py
 ```
 
+추출 결과 자동 검증:
+
+```bash
+python tests/validate_extraction_outputs.py --output-dir output/<video_name>
+```
+
 ## EXE 빌드 (로컬)
 
 ```bash

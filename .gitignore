@@ -6,3 +6,4 @@ build/
 output/
 .cursor/
 *.spec
+tests_artifacts/
