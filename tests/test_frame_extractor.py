@@ -97,7 +97,7 @@ def test_extract_video_frames_uses_fallback_when_cv2_cannot_open(tmp_path: Path,
     real_video_capture = frame_extractor.cv2.VideoCapture
 
     class FakeCapture:
-        def __init__(self, _path: str):
+        def __init__(self, *_args, **_kwargs):
             pass
 
         def isOpened(self) -> bool:
@@ -126,7 +126,7 @@ def test_fallback_unavailable_does_not_crash(tmp_path: Path, monkeypatch: pytest
     real_import_module = frame_extractor.importlib.import_module
 
     class FakeCapture:
-        def __init__(self, _path: str):
+        def __init__(self, *_args, **_kwargs):
             pass
 
         def isOpened(self) -> bool:
@@ -151,3 +151,51 @@ def test_fallback_unavailable_does_not_crash(tmp_path: Path, monkeypatch: pytest
 
     assert result.success is False
     assert "fallback backend is unavailable" in result.message.lower()
+
+
+def test_extract_video_tries_alternate_cv2_backend_before_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _clean_output_dir()
+    video_path = create_synthetic_video(tmp_path / "backend_try.mp4", frame_count=6, fourcc="mp4v")
+    options = ExtractionOptions(interval=2, image_format=ImageFormat.PNG)
+
+    real_video_capture = frame_extractor.cv2.VideoCapture
+    real_import_module = frame_extractor.importlib.import_module
+
+    class FakeCapture:
+        def __init__(self, *_args, **_kwargs):
+            self.use_backend = len(_args) >= 2
+            self.frames_left = 6 if self.use_backend else 0
+
+        def isOpened(self) -> bool:
+            return self.use_backend
+
+        def read(self):
+            if self.frames_left <= 0:
+                return False, None
+            self.frames_left -= 1
+            frame = np.zeros((120, 160, 3), dtype=np.uint8)
+            frame[:, :, 1] = 180
+            return True, frame
+
+        def release(self) -> None:
+            return None
+
+    def fail_if_import_imageio(name: str):
+        if name == "imageio":
+            raise AssertionError("imageio fallback should not be used when alternate cv2 backend works")
+        return real_import_module(name)
+
+    monkeypatch.setattr(frame_extractor.cv2, "VideoCapture", FakeCapture)
+    monkeypatch.setattr(frame_extractor.importlib, "import_module", fail_if_import_imageio)
+
+    try:
+        result = extract_video_frames(video_path, options)
+    finally:
+        monkeypatch.setattr(frame_extractor.cv2, "VideoCapture", real_video_capture)
+        monkeypatch.setattr(frame_extractor.importlib, "import_module", real_import_module)
+
+    assert result.success is True
+    assert result.saved_count == 3
+    assert "opencv backend" in result.message.lower()

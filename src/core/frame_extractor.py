@@ -86,57 +86,75 @@ def _extract_with_cv2(
     jpg_quality: int,
     progress_cb: ProgressCallback | None,
 ) -> VideoExtractionResult | None:
-    cap = cv2.VideoCapture(str(video_path))
-    if not cap.isOpened():
-        return None
-
     ext = ".jpg" if image_format == ImageFormat.JPG else ".png"
-    frame_index = 0
-    saved_count = 0
-    failure_message = ""
 
-    while True:
-        ok, frame = cap.read()
-        if not ok:
-            break
+    backend_candidates: list[tuple[str, int | None]] = [("default", None)]
+    for backend_name in ("CAP_FFMPEG", "CAP_DSHOW", "CAP_MSMF"):
+        backend_id = getattr(cv2, backend_name, None)
+        if isinstance(backend_id, int):
+            backend_candidates.append((backend_name.lower(), backend_id))
 
-        if frame_index % interval == 0:
-            filename = f"{video_path.stem}_{saved_count:06d}{ext}"
-            out_path = output_dir / filename
-            written = _save_frame(frame, out_path, image_format, jpg_quality)
-            if not written:
-                failure_message = f"Failed to save frame: {out_path}"
+    seen_backend_ids: set[int | None] = set()
+    unique_candidates: list[tuple[str, int | None]] = []
+    for name, backend_id in backend_candidates:
+        if backend_id in seen_backend_ids:
+            continue
+        seen_backend_ids.add(backend_id)
+        unique_candidates.append((name, backend_id))
+
+    for backend_name, backend_id in unique_candidates:
+        cap = cv2.VideoCapture(str(video_path)) if backend_id is None else cv2.VideoCapture(str(video_path), backend_id)
+        if not cap.isOpened():
+            cap.release()
+            continue
+
+        frame_index = 0
+        saved_count = 0
+        failure_message = ""
+
+        while True:
+            ok, frame = cap.read()
+            if not ok:
                 break
-            saved_count += 1
-            if progress_cb and saved_count % 25 == 0:
-                progress_cb(f"Saved {saved_count} frames from {video_path.name}")
 
-        frame_index += 1
+            if frame_index % interval == 0:
+                filename = f"{video_path.stem}_{saved_count:06d}{ext}"
+                out_path = output_dir / filename
+                written = _save_frame(frame, out_path, image_format, jpg_quality)
+                if not written:
+                    failure_message = f"Failed to save frame: {out_path}"
+                    break
+                saved_count += 1
+                if progress_cb and saved_count % 25 == 0:
+                    progress_cb(f"Saved {saved_count} frames from {video_path.name} ({backend_name})")
 
-    cap.release()
+            frame_index += 1
 
-    # Some codec/container combos open but decode no frames. Let fallback try.
-    if saved_count == 0 and frame_index == 0 and not failure_message:
-        return None
+        cap.release()
 
-    if failure_message:
+        if failure_message:
+            return VideoExtractionResult(
+                video_path=video_path,
+                output_dir=output_dir,
+                saved_count=saved_count,
+                total_frames_seen=frame_index,
+                success=False,
+                message=failure_message,
+            )
+
+        if saved_count == 0 and frame_index == 0:
+            continue
+
         return VideoExtractionResult(
             video_path=video_path,
             output_dir=output_dir,
             saved_count=saved_count,
             total_frames_seen=frame_index,
-            success=False,
-            message=failure_message,
+            success=True,
+            message=f"Completed with OpenCV backend: {backend_name}.",
         )
 
-    return VideoExtractionResult(
-        video_path=video_path,
-        output_dir=output_dir,
-        saved_count=saved_count,
-        total_frames_seen=frame_index,
-        success=True,
-        message="Completed with OpenCV.",
-    )
+    return None
 
 
 def _extract_with_imageio_fallback(

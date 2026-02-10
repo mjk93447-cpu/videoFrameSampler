@@ -46,7 +46,7 @@ python tests/generate_test_video.py
 ## EXE 빌드 (로컬)
 
 ```bash
-pyinstaller --noconfirm --onefile --windowed --name videoFrameSampler --copy-metadata imageio --copy-metadata imageio-ffmpeg src/app.py
+pyinstaller --noconfirm --onefile --windowed --name videoFrameSampler --hidden-import imageio --hidden-import imageio_ffmpeg --copy-metadata imageio --copy-metadata imageio-ffmpeg src/app.py
 ```
 
 결과물:
