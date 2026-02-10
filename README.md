@@ -1,12 +1,61 @@
-# videoFrameSampler
-목적
-오프라인 환경에서 작동하는 비디오 프레임 샘플링 기능을 가진 윈도우 exe파일 개발
+# videoFrameSampler (ver1)
 
-1.최대 500개까지 지정한 비디오 파일을 지정받는다. GUI 필요.
-2.지정된 비디오를 첫번째 비디오부터 순차적으로 프레임단위로 나누어 비디오 처음부터 끝까지 순서대로 원본화질 이미지 파일을 만들어 저장한다. 파일이름에 원본 비디오 파일명과 순서를 저장하여 다음 작업에서 비디오 분석작업을 진행할 수 있도록 한다.
-3.프레임이 너무 많은 경우 디폴트 1프레임 간격부터 2프레임간격 3프레임 간격 등 원하는 간격을 입력받아서 일정한 간격으로 프레임을 나누어 저장하는 기능도 gui를 통해 제공한다.
-4.파일 저장 경로는 실행파일이 있는 폴더에 분석대상인 비디오 파일이름으로 폴더를 만들고 그 안에 샘플링된 프레임 이미지들을 표준적인 파일명 저장방법을 통해 순서가 명확히 표시되도록 저장한다. 
-5.실제 분석에 사용되는 테스트용 비디오 파일을 생성하고 테스트를 통해 원본화질로 이미지 파일이 순서대로 생성되는지를 테스트하라. 
-6.윈도우 UI/UX 전문가 모델을 투입하여 GUI의 사용성을 평가하고 디자인 및 폰트, 화면 배치 등을 개선하여라. 최소 5번 이상 반복 평가, 피드백, 개선 작업을 거쳐 최선을 결과물을 확정하라.
+오프라인 환경에서 동작하는 Windows GUI 기반 비디오 프레임 샘플러입니다.
 
-최선의 결과물을 정리하여 깃허브에 커밋/푸쉬하고 깃허브 액션에 exe 실행파일을 생성해라
+## 핵심 기능
+
+- 최대 500개 비디오 파일을 한 번에 선택하고 순차 처리
+- 샘플링 간격 설정 (기본 1, 사용자 지정 N)
+- 저장 포맷 선택:
+  - PNG (기본, 품질 우선)
+  - JPG (품질 슬라이더 제공)
+- Fast mode:
+  - JPG 기본 선택
+  - 첫 번째 비디오 FPS/해상도 기반 간격 제안
+- 출력 경로/규칙:
+  - `output/<video_name>/`
+  - 이름 충돌 시 `__2`, `__3` 접미사
+  - 파일명: `<video_name>_<frame_index_6digits>.<ext>`
+
+## 기술 스택
+
+- GUI: PySide6
+- 프레임 추출: OpenCV
+- 패키징: PyInstaller
+- 테스트: pytest
+
+## 로컬 실행
+
+```bash
+python -m pip install -r requirements.txt
+python src/app.py
+```
+
+## 테스트
+
+```bash
+python -m pytest -q
+```
+
+테스트 비디오 생성 유틸:
+
+```bash
+python tests/generate_test_video.py
+```
+
+## EXE 빌드 (로컬)
+
+```bash
+pyinstaller --noconfirm --onefile --windowed --name videoFrameSampler src/app.py
+```
+
+결과물:
+
+- `dist/videoFrameSampler.exe`
+
+## 문서
+
+- 요구사항/명세: `docs/specification.md`
+- 개선 사이클 기록: `docs/dev_test_cycles.md`
+- 릴리스 루틴 템플릿: `docs/release_routine.md`
+- CI 빌드: `.github/workflows/build-exe.yml`
