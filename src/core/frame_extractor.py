@@ -1,11 +1,11 @@
 from __future__ import annotations
 
+import importlib
 import sys
 from pathlib import Path
 from typing import Callable, Iterable
 
 import cv2
-import imageio
 import numpy as np
 
 from core.models import ExtractionOptions, ImageFormat, VideoExtractionResult
@@ -150,6 +150,18 @@ def _extract_with_imageio_fallback(
     ext = ".jpg" if image_format == ImageFormat.JPG else ".png"
     frame_index = 0
     saved_count = 0
+
+    try:
+        imageio = importlib.import_module("imageio")
+    except Exception as exc:
+        return VideoExtractionResult(
+            video_path=video_path,
+            output_dir=output_dir,
+            saved_count=0,
+            total_frames_seen=0,
+            success=False,
+            message=f"Fallback backend is unavailable: {exc}",
+        )
 
     try:
         with imageio.get_reader(str(video_path), format="ffmpeg") as reader:

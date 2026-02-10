@@ -64,7 +64,7 @@ class ExtractionWorker(QObject):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("videoFrameSampler ver1")
+        self.setWindowTitle("videoFrameSampler ver2")
         self.resize(960, 680)
         self.selected_files: list[Path] = []
         self.worker_thread: QThread | None = None

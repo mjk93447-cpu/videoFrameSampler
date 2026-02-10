@@ -1,6 +1,6 @@
 [project]
 name = "videoframesampler"
-version = "1.0.0"
+version = "2.0.0"
 description = "Offline GUI app for deterministic video frame extraction."
 requires-python = ">=3.10"
 dependencies = [

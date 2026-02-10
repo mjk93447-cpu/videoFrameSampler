@@ -1,4 +1,4 @@
-# videoFrameSampler (ver1)
+# videoFrameSampler (ver2)
 
 오프라인 환경에서 동작하는 Windows GUI 기반 비디오 프레임 샘플러입니다.
 
@@ -46,7 +46,7 @@ python tests/generate_test_video.py
 ## EXE 빌드 (로컬)
 
 ```bash
-pyinstaller --noconfirm --onefile --windowed --name videoFrameSampler src/app.py
+pyinstaller --noconfirm --onefile --windowed --name videoFrameSampler --copy-metadata imageio --copy-metadata imageio-ffmpeg src/app.py
 ```
 
 결과물:

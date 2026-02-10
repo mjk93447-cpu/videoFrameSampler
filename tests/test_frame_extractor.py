@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.metadata
 import shutil
 import sys
 from pathlib import Path
@@ -114,3 +115,39 @@ def test_extract_video_frames_uses_fallback_when_cv2_cannot_open(tmp_path: Path,
     assert result.success is True
     assert result.saved_count == 4
     assert "fallback" in result.message.lower()
+
+
+def test_fallback_unavailable_does_not_crash(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _clean_output_dir()
+    video_path = create_synthetic_video(tmp_path / "fallback_missing.mp4", frame_count=8, fourcc="mp4v")
+    options = ExtractionOptions(interval=2, image_format=ImageFormat.PNG)
+
+    real_video_capture = frame_extractor.cv2.VideoCapture
+    real_import_module = frame_extractor.importlib.import_module
+
+    class FakeCapture:
+        def __init__(self, _path: str):
+            pass
+
+        def isOpened(self) -> bool:
+            return False
+
+        def release(self) -> None:
+            return None
+
+    def fake_import_module(name: str):
+        if name == "imageio":
+            raise importlib.metadata.PackageNotFoundError("imageio")
+        return real_import_module(name)
+
+    monkeypatch.setattr(frame_extractor.cv2, "VideoCapture", FakeCapture)
+    monkeypatch.setattr(frame_extractor.importlib, "import_module", fake_import_module)
+
+    try:
+        result = extract_video_frames(video_path, options)
+    finally:
+        monkeypatch.setattr(frame_extractor.cv2, "VideoCapture", real_video_capture)
+        monkeypatch.setattr(frame_extractor.importlib, "import_module", real_import_module)
+
+    assert result.success is False
+    assert "fallback backend is unavailable" in result.message.lower()
