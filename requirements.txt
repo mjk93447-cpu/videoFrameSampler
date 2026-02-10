@@ -3,3 +3,5 @@ numpy
 PySide6
 pytest
 pyinstaller
+imageio
+imageio-ffmpeg

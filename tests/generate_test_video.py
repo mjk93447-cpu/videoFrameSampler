@@ -12,14 +12,25 @@ def create_synthetic_video(
     width: int = 320,
     height: int = 180,
     fps: int = 12,
+    fourcc: str | None = None,
 ) -> Path:
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(str(output_path), fourcc, fps, (width, height))
+    selected_fourcc = fourcc
+    if selected_fourcc is None:
+        suffix = output_path.suffix.lower()
+        if suffix == ".avi":
+            selected_fourcc = "MJPG"
+        elif suffix in {".mkv", ".webm"}:
+            selected_fourcc = "XVID"
+        else:
+            selected_fourcc = "mp4v"
+
+    writer_codec = cv2.VideoWriter_fourcc(*selected_fourcc)
+    writer = cv2.VideoWriter(str(output_path), writer_codec, fps, (width, height))
     if not writer.isOpened():
-        raise RuntimeError(f"Failed to open VideoWriter for {output_path}")
+        raise RuntimeError(f"Failed to open VideoWriter for {output_path} with fourcc={selected_fourcc}")
 
     for idx in range(frame_count):
         frame = np.zeros((height, width, 3), dtype=np.uint8)

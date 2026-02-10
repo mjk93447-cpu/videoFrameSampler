@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Callable, Iterable
 
 import cv2
+import imageio
 import numpy as np
 
 from core.models import ExtractionOptions, ImageFormat, VideoExtractionResult
@@ -77,32 +78,19 @@ def _save_frame(
         return False
 
 
-def extract_video_frames(
+def _extract_with_cv2(
     video_path: Path,
-    options: ExtractionOptions,
-    progress_cb: ProgressCallback | None = None,
-) -> VideoExtractionResult:
-    video_path = Path(video_path)
-    base_dir = get_runtime_base_dir()
-    output_root = base_dir / "output"
-    output_dir = make_unique_output_dir(video_path.stem, output_root)
-
+    output_dir: Path,
+    interval: int,
+    image_format: ImageFormat,
+    jpg_quality: int,
+    progress_cb: ProgressCallback | None,
+) -> VideoExtractionResult | None:
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
-        return VideoExtractionResult(
-            video_path=video_path,
-            output_dir=output_dir,
-            saved_count=0,
-            total_frames_seen=0,
-            success=False,
-            message="Failed to open video file.",
-        )
+        return None
 
-    interval = options.normalized_interval()
-    image_format = options.image_format
     ext = ".jpg" if image_format == ImageFormat.JPG else ".png"
-    jpg_quality = options.normalized_jpg_quality()
-
     frame_index = 0
     saved_count = 0
     failure_message = ""
@@ -127,6 +115,10 @@ def extract_video_frames(
 
     cap.release()
 
+    # Some codec/container combos open but decode no frames. Let fallback try.
+    if saved_count == 0 and frame_index == 0 and not failure_message:
+        return None
+
     if failure_message:
         return VideoExtractionResult(
             video_path=video_path,
@@ -143,7 +135,109 @@ def extract_video_frames(
         saved_count=saved_count,
         total_frames_seen=frame_index,
         success=True,
-        message="Completed.",
+        message="Completed with OpenCV.",
+    )
+
+
+def _extract_with_imageio_fallback(
+    video_path: Path,
+    output_dir: Path,
+    interval: int,
+    image_format: ImageFormat,
+    jpg_quality: int,
+    progress_cb: ProgressCallback | None,
+) -> VideoExtractionResult:
+    ext = ".jpg" if image_format == ImageFormat.JPG else ".png"
+    frame_index = 0
+    saved_count = 0
+
+    try:
+        with imageio.get_reader(str(video_path), format="ffmpeg") as reader:
+            for frame in reader:
+                if frame_index % interval == 0:
+                    # imageio returns RGB arrays; convert to BGR for cv2 encoding.
+                    bgr_frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                    filename = f"{video_path.stem}_{saved_count:06d}{ext}"
+                    out_path = output_dir / filename
+                    written = _save_frame(bgr_frame, out_path, image_format, jpg_quality)
+                    if not written:
+                        return VideoExtractionResult(
+                            video_path=video_path,
+                            output_dir=output_dir,
+                            saved_count=saved_count,
+                            total_frames_seen=frame_index,
+                            success=False,
+                            message=f"Failed to save frame: {out_path}",
+                        )
+                    saved_count += 1
+                    if progress_cb and saved_count % 25 == 0:
+                        progress_cb(f"[fallback] Saved {saved_count} frames from {video_path.name}")
+
+                frame_index += 1
+    except Exception as exc:
+        return VideoExtractionResult(
+            video_path=video_path,
+            output_dir=output_dir,
+            saved_count=saved_count,
+            total_frames_seen=frame_index,
+            success=False,
+            message=f"Failed to decode video with fallback backend: {exc}",
+        )
+
+    if saved_count == 0 and frame_index == 0:
+        return VideoExtractionResult(
+            video_path=video_path,
+            output_dir=output_dir,
+            saved_count=0,
+            total_frames_seen=0,
+            success=False,
+            message="Failed to decode any frame with OpenCV and fallback backend.",
+        )
+
+    return VideoExtractionResult(
+        video_path=video_path,
+        output_dir=output_dir,
+        saved_count=saved_count,
+        total_frames_seen=frame_index,
+        success=True,
+        message="Completed with fallback backend.",
+    )
+
+
+def extract_video_frames(
+    video_path: Path,
+    options: ExtractionOptions,
+    progress_cb: ProgressCallback | None = None,
+) -> VideoExtractionResult:
+    video_path = Path(video_path)
+    base_dir = get_runtime_base_dir()
+    output_root = base_dir / "output"
+    output_dir = make_unique_output_dir(video_path.stem, output_root)
+
+    interval = options.normalized_interval()
+    image_format = options.image_format
+    jpg_quality = options.normalized_jpg_quality()
+
+    cv2_result = _extract_with_cv2(
+        video_path=video_path,
+        output_dir=output_dir,
+        interval=interval,
+        image_format=image_format,
+        jpg_quality=jpg_quality,
+        progress_cb=progress_cb,
+    )
+    if cv2_result is not None:
+        return cv2_result
+
+    if progress_cb:
+        progress_cb(f"[fallback] OpenCV decode failed for {video_path.name}. Trying ffmpeg backend.")
+    return _extract_with_imageio_fallback(
+        video_path=video_path,
+        output_dir=output_dir,
+        interval=interval,
+        image_format=image_format,
+        jpg_quality=jpg_quality,
+        progress_cb=progress_cb,
     )
 
 
