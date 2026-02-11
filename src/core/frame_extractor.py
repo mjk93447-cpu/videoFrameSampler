@@ -169,6 +169,48 @@ def _apply_roi(frame: np.ndarray, roi: RoiBox | None) -> np.ndarray:
     return frame[y:y2, x:x2]
 
 
+def _scan_container_offsets(raw: bytes) -> list[tuple[int, str, str]]:
+    candidates: list[tuple[int, str, str]] = []
+
+    riff_pos = raw.find(b"RIFF")
+    while riff_pos >= 0:
+        if riff_pos + 12 <= len(raw):
+            marker = raw[riff_pos + 8 : riff_pos + 12]
+            if marker == b"AVI ":
+                candidates.append((riff_pos, "riff_avi", ".avi"))
+        riff_pos = raw.find(b"RIFF", riff_pos + 1)
+
+    ftyp_pos = raw.find(b"ftyp")
+    while ftyp_pos >= 0:
+        start = max(0, ftyp_pos - 4)
+        if start + 12 <= len(raw):
+            candidates.append((start, "mp4_ftyp", ".mp4"))
+        ftyp_pos = raw.find(b"ftyp", ftyp_pos + 1)
+
+    asf_guid = b"\x30\x26\xB2\x75\x8E\x66\xCF\x11\xA6\xD9\x00\xAA\x00\x62\xCE\x6C"
+    asf_pos = raw.find(asf_guid)
+    while asf_pos >= 0:
+        candidates.append((asf_pos, "asf_guid", ".asf"))
+        asf_pos = raw.find(asf_guid, asf_pos + 1)
+
+    ebml_pos = raw.find(b"\x1A\x45\xDF\xA3")
+    while ebml_pos >= 0:
+        candidates.append((ebml_pos, "ebml", ".mkv"))
+        ebml_pos = raw.find(b"\x1A\x45\xDF\xA3", ebml_pos + 1)
+
+    ogg_pos = raw.find(b"OggS")
+    while ogg_pos >= 0:
+        candidates.append((ogg_pos, "ogg", ".ogv"))
+        ogg_pos = raw.find(b"OggS", ogg_pos + 1)
+
+    dedup: dict[int, tuple[int, str, str]] = {}
+    for offset, label, ext in sorted(candidates, key=lambda item: item[0]):
+        if offset <= 0:
+            continue
+        dedup.setdefault(offset, (offset, label, ext))
+    return list(dedup.values())
+
+
 def _find_major_motion_window(
     motion_scores: list[float],
     fps: float,
@@ -197,6 +239,14 @@ def _find_major_motion_window(
                 best_start = start
                 best_len = length
     return best_start, min(total - 1, best_start + best_len - 1)
+
+
+def _normalize_output_filenames(output_dir: Path, source_stem: str, target_stem: str, ext: str) -> None:
+    files = sorted(output_dir.glob(f"{source_stem}_*{ext}"))
+    for idx, src in enumerate(files):
+        dst = output_dir / f"{target_stem}_{idx:06d}{ext}"
+        if src != dst:
+            src.replace(dst)
 
 def _extract_with_cv2(
     video_path: Path,
@@ -779,6 +829,79 @@ def _extract_with_legacy_codec_bridge(
     )
 
 
+def _extract_with_container_carving(
+    video_path: Path,
+    output_dir: Path,
+    interval: int,
+    image_format: ImageFormat,
+    jpg_quality: int,
+    roi: RoiBox | None,
+    progress_cb: ProgressCallback | None,
+) -> VideoExtractionResult:
+    try:
+        raw = video_path.read_bytes()
+    except OSError as exc:
+        return VideoExtractionResult(
+            video_path=video_path,
+            output_dir=output_dir,
+            saved_count=0,
+            total_frames_seen=0,
+            success=False,
+            message=f"Container carving failed to read file: {exc}",
+        )
+
+    candidates = _scan_container_offsets(raw)
+    if not candidates:
+        return VideoExtractionResult(
+            video_path=video_path,
+            output_dir=output_dir,
+            saved_count=0,
+            total_frames_seen=0,
+            success=False,
+            message="Container carving found no embedded stream signature.",
+        )
+
+    errors: list[str] = []
+    ext = ".jpg" if image_format == ImageFormat.JPG else ".png"
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_dir = Path(tmp)
+        for offset, label, carved_ext in candidates:
+            if progress_cb:
+                progress_cb(f"[carve] Trying embedded stream at offset {offset} ({label}).")
+            carved_path = tmp_dir / f"{video_path.stem}__carved_{offset}{carved_ext}"
+            carved_path.write_bytes(raw[offset:])
+
+            recovery = _extract_with_ffmpeg_recovery(
+                video_path=carved_path,
+                output_dir=output_dir,
+                interval=interval,
+                image_format=image_format,
+                jpg_quality=jpg_quality,
+                roi=roi,
+                progress_cb=progress_cb,
+            )
+            if recovery.success:
+                _normalize_output_filenames(output_dir, carved_path.stem, video_path.stem, ext)
+                return VideoExtractionResult(
+                    video_path=video_path,
+                    output_dir=output_dir,
+                    saved_count=recovery.saved_count,
+                    total_frames_seen=recovery.total_frames_seen,
+                    success=True,
+                    message=f"Completed with container carving ({label} @ {offset}).",
+                )
+            errors.append(f"{label}@{offset}: {recovery.message}")
+
+    return VideoExtractionResult(
+        video_path=video_path,
+        output_dir=output_dir,
+        saved_count=0,
+        total_frames_seen=0,
+        success=False,
+        message=f"Container carving failed: {' | '.join(errors)}",
+    )
+
+
 def _save_motion_segment_with_cv2(
     video_path: Path,
     output_dir: Path,
@@ -990,6 +1113,20 @@ def extract_video_frames(
         return recovery_result
 
     if progress_cb:
+        progress_cb(f"[carve] Trying embedded container carving for {video_path.name}.")
+    carving_result = _extract_with_container_carving(
+        video_path=video_path,
+        output_dir=output_dir,
+        interval=interval,
+        image_format=image_format,
+        jpg_quality=jpg_quality,
+        roi=roi,
+        progress_cb=progress_cb,
+    )
+    if carving_result.success:
+        return carving_result
+
+    if progress_cb:
         progress_cb(f"[repair] Trying video repair transcode for {video_path.name}.")
     repaired_video_path, repair_message = _repair_video_with_ffmpeg(
         video_path=video_path,
@@ -1056,7 +1193,7 @@ def extract_video_frames(
         total_frames_seen=0,
         success=False,
         message=(
-            f"{imageio_result.message}\n\n{recovery_result.message}\n\n{repair_message}\n\n"
+            f"{imageio_result.message}\n\n{recovery_result.message}\n\n{carving_result.message}\n\n{repair_message}\n\n"
             f"{legacy_result.message}\n\n{salvage_result.message}"
         ),
     )

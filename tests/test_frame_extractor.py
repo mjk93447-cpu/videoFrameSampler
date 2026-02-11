@@ -695,3 +695,64 @@ def test_legacy_codec_bridge_extracts_frames(tmp_path: Path, monkeypatch: pytest
     assert result.success is True
     assert result.saved_count == 1
     assert "legacy codec bridge" in result.message.lower()
+
+
+def test_scan_container_offsets_detects_embedded_signatures() -> None:
+    raw = (
+        b"JUNK" * 8
+        + b"\x30\x26\xB2\x75\x8E\x66\xCF\x11\xA6\xD9\x00\xAA\x00\x62\xCE\x6C"
+        + b"xxxx"
+        + b"RIFF" + b"\x20\x00\x00\x00" + b"AVI "
+    )
+    found = frame_extractor._scan_container_offsets(raw)
+    labels = [item[1] for item in found]
+    assert "asf_guid" in labels
+    assert "riff_avi" in labels
+
+
+def test_extract_with_container_carving_recovers_embedded_stream(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    out_dir = tmp_path / "carve_out"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    video_path = tmp_path / "wrapped_media.bin"
+    # leading garbage + RIFF AVI signature
+    video_path.write_bytes(b"X" * 64 + b"RIFF" + b"\x20\x00\x00\x00" + b"AVI " + b"Y" * 128)
+
+    real_recovery = frame_extractor._extract_with_ffmpeg_recovery
+    calls = {"count": 0}
+
+    def fake_recovery(video_path, output_dir, interval, image_format, jpg_quality, roi, progress_cb):
+        calls["count"] += 1
+        out = output_dir / f"{Path(video_path).stem}_000000.png"
+        img = np.zeros((50, 60, 3), dtype=np.uint8)
+        ok, encoded = cv2.imencode(".png", img)
+        assert ok
+        encoded.tofile(str(out))
+        return VideoExtractionResult(
+            video_path=Path(video_path),
+            output_dir=output_dir,
+            saved_count=1,
+            total_frames_seen=-1,
+            success=True,
+            message="carved success",
+        )
+
+    monkeypatch.setattr(frame_extractor, "_extract_with_ffmpeg_recovery", fake_recovery)
+    try:
+        result = frame_extractor._extract_with_container_carving(
+            video_path=video_path,
+            output_dir=out_dir,
+            interval=2,
+            image_format=ImageFormat.PNG,
+            jpg_quality=95,
+            roi=None,
+            progress_cb=None,
+        )
+    finally:
+        monkeypatch.setattr(frame_extractor, "_extract_with_ffmpeg_recovery", real_recovery)
+
+    assert calls["count"] >= 1
+    assert result.success is True
+    assert result.saved_count == 1
+    assert (out_dir / "wrapped_media_000000.png").exists()
