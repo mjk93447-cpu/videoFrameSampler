@@ -41,6 +41,17 @@ FFMPEG_RELAXED_INPUT_PARAMS: list[str] = [
     "400M",
 ]
 
+FFMPEG_ULTRA_RELAXED_INPUT_PARAMS: list[str] = [
+    "-err_detect",
+    "ignore_err",
+    "-fflags",
+    "+genpts+igndts+ignidx+nobuffer+nofillin+discardcorrupt",
+    "-analyzeduration",
+    "1000M",
+    "-probesize",
+    "1000M",
+]
+
 FFMPEG_FORCED_INPUT_FORMATS: tuple[str, ...] = (
     "avi",
     "asf",
@@ -642,6 +653,8 @@ def _run_ffmpeg_recovery_attempt(
     input_params: list[str],
     forced_format: str | None = None,
     decoder_tuning_args: list[str] | None = None,
+    output_tuning_args: list[str] | None = None,
+    disable_interval_select: bool = False,
 ) -> subprocess.CompletedProcess[str]:
     cmd: list[str] = [
         str(ffmpeg_exe),
@@ -654,16 +667,18 @@ def _run_ffmpeg_recovery_attempt(
         cmd.extend(["-f", forced_format])
     if decoder_tuning_args:
         cmd.extend(decoder_tuning_args)
-    cmd.extend(
-        [
-            "-i",
-            str(video_path),
-            "-vf",
-            f"select=not(mod(n\\,{interval}))",
-            "-vsync",
-            "vfr",
-        ]
-    )
+    cmd.extend(["-i", str(video_path)])
+    if not disable_interval_select:
+        cmd.extend(
+            [
+                "-vf",
+                f"select=not(mod(n\\,{interval}))",
+                "-vsync",
+                "vfr",
+            ]
+        )
+    if output_tuning_args:
+        cmd.extend(output_tuning_args)
     if image_format == ImageFormat.JPG:
         cmd.extend(["-q:v", str(_jpg_quality_to_ffmpeg_qscale(jpg_quality))])
     cmd.extend(["-y", str(pattern_path)])
@@ -722,6 +737,56 @@ def _extract_with_ffmpeg_recovery(
                 "input_params": FFMPEG_RELAXED_INPUT_PARAMS,
                 "decoder_tuning_args": ["-max_error_rate", "1", "-flags2", "+showall"],
             },
+            {
+                "label": "aggressive_nokey_auto",
+                "forced_format": None,
+                "input_params": FFMPEG_RELAXED_INPUT_PARAMS,
+                "decoder_tuning_args": ["-max_error_rate", "1", "-flags2", "+showall", "-skip_frame", "nokey"],
+            },
+            {
+                "label": "aggressive_nokey_h264",
+                "forced_format": "h264",
+                "input_params": FFMPEG_RELAXED_INPUT_PARAMS,
+                "decoder_tuning_args": ["-max_error_rate", "1", "-flags2", "+showall", "-skip_frame", "nokey"],
+            },
+            {
+                "label": "ultra_relaxed_h264",
+                "forced_format": "h264",
+                "input_params": FFMPEG_ULTRA_RELAXED_INPUT_PARAMS,
+                "decoder_tuning_args": ["-max_error_rate", "1", "-flags2", "+showall"],
+                "disable_interval_select": True,
+            },
+            {
+                "label": "ultra_relaxed_auto",
+                "forced_format": None,
+                "input_params": FFMPEG_ULTRA_RELAXED_INPUT_PARAMS,
+                "decoder_tuning_args": ["-max_error_rate", "1", "-flags2", "+showall"],
+                "disable_interval_select": True,
+            },
+            {
+                "label": "decoder_h264_sw",
+                "forced_format": "h264",
+                "input_params": FFMPEG_RELAXED_INPUT_PARAMS,
+                "decoder_tuning_args": ["-c:v", "h264", "-max_error_rate", "1", "-flags2", "+showall"],
+            },
+            {
+                "label": "decoder_h264_vfw",
+                "forced_format": "h264",
+                "input_params": FFMPEG_RELAXED_INPUT_PARAMS,
+                "decoder_tuning_args": ["-c:v", "h264_vfw", "-max_error_rate", "1", "-flags2", "+showall"],
+            },
+            {
+                "label": "decoder_h264_qsv",
+                "forced_format": "h264",
+                "input_params": FFMPEG_RELAXED_INPUT_PARAMS,
+                "decoder_tuning_args": ["-c:v", "h264_qsv", "-max_error_rate", "1", "-flags2", "+showall"],
+            },
+            {
+                "label": "decoder_h264_cuvid",
+                "forced_format": "h264",
+                "input_params": FFMPEG_RELAXED_INPUT_PARAMS,
+                "decoder_tuning_args": ["-c:v", "h264_cuvid", "-max_error_rate", "1", "-flags2", "+showall"],
+            },
         ]
     )
     success_label = "auto"
@@ -742,6 +807,8 @@ def _extract_with_ffmpeg_recovery(
             input_params=list(attempt["input_params"]),  # type: ignore[arg-type]
             forced_format=forced_format,
             decoder_tuning_args=list(attempt.get("decoder_tuning_args", [])),  # type: ignore[arg-type]
+            output_tuning_args=list(attempt.get("output_tuning_args", [])),  # type: ignore[arg-type]
+            disable_interval_select=bool(attempt.get("disable_interval_select", False)),
         )
 
         extracted = sorted(tmp_dir.glob(f"frame_*{ext}"))
@@ -907,6 +974,35 @@ def _extract_with_h264_salvage(
             rebuilt.extend(start_code + nal)
         return bytes(rebuilt)
 
+    def _collect_loose_parameter_sets(payload: bytes, nal_type: int, max_candidates: int = 12) -> list[bytes]:
+        results: list[bytes] = []
+        seen: set[bytes] = set()
+        size = len(payload)
+        for idx in range(0, max(0, size - 4)):
+            if len(results) >= max_candidates:
+                break
+            b0 = payload[idx]
+            if (b0 & 0x80) != 0:
+                continue
+            if (b0 & 0x1F) != nal_type:
+                continue
+            end = min(size, idx + 80)
+            marker_4 = payload.find(b"\x00\x00\x00\x01", idx + 1, end)
+            marker_3 = payload.find(b"\x00\x00\x01", idx + 1, end)
+            markers = [m for m in (marker_4, marker_3) if m >= 0]
+            if markers:
+                end = min(markers)
+            nal = bytes(payload[idx:end])
+            if len(nal) < 4:
+                continue
+            if nal in seen:
+                continue
+            if nal_type == 7 and len(nal) >= 3 and nal[1] not in (66, 77, 88, 100, 110, 122, 244):
+                continue
+            seen.add(nal)
+            results.append(nal)
+        return results
+
     def _scan_avcc_records(payload: bytes, max_records: int = 12) -> list[dict[str, object]]:
         records: list[dict[str, object]] = []
         size = len(payload)
@@ -1061,9 +1157,19 @@ def _extract_with_h264_salvage(
 
     sps, pps = _extract_sps_pps(raw)
     avcc_records = _scan_avcc_records(raw)
+    loose_sps: list[bytes] = []
+    loose_pps: list[bytes] = []
     if avcc_records and (sps is None or pps is None):
         sps = bytes(avcc_records[0]["sps"]) if sps is None else sps
         pps = bytes(avcc_records[0]["pps"]) if pps is None else pps
+    if sps is None:
+        loose_sps = _collect_loose_parameter_sets(raw, nal_type=7, max_candidates=14)
+        if loose_sps:
+            sps = loose_sps[0]
+    if pps is None:
+        loose_pps = _collect_loose_parameter_sets(raw, nal_type=8, max_candidates=20)
+        if loose_pps:
+            pps = loose_pps[0]
     if progress_cb:
         progress_cb(
             "[salvage] SPS/PPS scan: "
@@ -1071,6 +1177,8 @@ def _extract_with_h264_salvage(
             + ", "
             + ("found PPS" if pps is not None else "no PPS")
         )
+        if loose_sps or loose_pps:
+            progress_cb(f"[salvage] loose SPS/PPS candidates: sps={len(loose_sps)}, pps={len(loose_pps)}")
         if avcc_records:
             length_sizes = ",".join(str(int(item.get("length_size", 0))) for item in avcc_records[:6])
             progress_cb(f"[salvage] avcC records detected: {len(avcc_records)} (len_size={length_sizes})")
@@ -1149,6 +1257,49 @@ def _extract_with_h264_salvage(
                     attempt_errors.append(
                         f"rebuild_{candidate_label}@{candidate_offset}: {rebuilt_details}"
                     )
+            if loose_sps and loose_pps:
+                pair_tries = 0
+                for sps_candidate in loose_sps[:6]:
+                    for pps_candidate in loose_pps[:6]:
+                        pair_tries += 1
+                        if progress_cb:
+                            progress_cb(
+                                f"[salvage] Trying loose SPS/PPS pair {pair_tries} for offset {candidate_offset}."
+                            )
+                        rebuilt_loose = _rebuild_h264_with_parameter_sets(
+                            raw[candidate_offset:], sps_candidate, pps_candidate
+                        )
+                        if not rebuilt_loose:
+                            continue
+                        for stale in tmp_dir.glob(f"salvage_*{ext}"):
+                            stale.unlink(missing_ok=True)
+                        loose_path = tmp_dir / f"{video_path.stem}_salvage_loose_{candidate_offset}_{pair_tries}.h264"
+                        loose_path.write_bytes(rebuilt_loose)
+                        loose_run = _run_ffmpeg_recovery_attempt(
+                            ffmpeg_exe=str(ffmpeg_exe),
+                            video_path=loose_path,
+                            pattern_path=pattern_path,
+                            interval=interval,
+                            image_format=image_format,
+                            jpg_quality=jpg_quality,
+                            input_params=FFMPEG_RELAXED_INPUT_PARAMS,
+                            forced_format="h264",
+                            decoder_tuning_args=["-max_error_rate", "1", "-flags2", "+showall"],
+                        )
+                        extracted = sorted(tmp_dir.glob(f"salvage_*{ext}"))
+                        if extracted:
+                            success_mode = f"loosepair_{candidate_label}@{candidate_offset}_{pair_tries}"
+                            break
+                        loose_stderr = (loose_run.stderr or "").strip()
+                        loose_stdout = (loose_run.stdout or "").strip()
+                        loose_details = loose_stderr or loose_stdout or f"ffmpeg return code {loose_run.returncode}"
+                        attempt_errors.append(
+                            f"loosepair_{candidate_label}@{candidate_offset}_{pair_tries}: {loose_details}"
+                        )
+                    if extracted:
+                        break
+            if extracted:
+                break
         if not extracted:
             preferred_len_sizes = [int(rec.get("length_size", 4)) for rec in avcc_records]
             avcc_len_sizes: list[int] = []
@@ -1258,6 +1409,10 @@ def _extract_with_legacy_codec_bridge(
     profiles: tuple[tuple[str, str], ...] = (
         ("avisource", f'AviSource("{avs_path}", audio=false)'),
         ("directshow", f'DirectShowSource("{avs_path}", audio=false, convertfps=true)'),
+        ("directshow_seekfalse", f'DirectShowSource("{avs_path}", audio=false, convertfps=false, seek=false)'),
+        ("directshow_seekzero", f'DirectShowSource("{avs_path}", audio=false, convertfps=true, seekzero=true)'),
+        ("avisource_rgb", f'AviSource("{avs_path}", audio=false, pixel_type="RGB32")'),
+        ("directshow_fps30", f'DirectShowSource("{avs_path}", audio=false, convertfps=true, fps=30)'),
     )
     errors: list[str] = []
 
