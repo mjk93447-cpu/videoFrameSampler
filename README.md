@@ -67,12 +67,13 @@ python src/diagnose_cli.py --video "D:\Non_Documents\SDV_NG_01.avi" --interval 1
 ## Build EXE
 
 ```bash
-python -m PyInstaller --noconfirm --onefile --windowed --name videoFrameSampler --hidden-import imageio --hidden-import imageio_ffmpeg --copy-metadata imageio --copy-metadata imageio-ffmpeg src/app.py
+python -m PyInstaller --noconfirm --onefile --windowed --name videoFrameSampler --hidden-import imageio --hidden-import imageio_ffmpeg --copy-metadata imageio --copy-metadata imageio-ffmpeg --exclude-module matplotlib --exclude-module tkinter --exclude-module PIL.ImageTk --exclude-module IPython --exclude-module jupyter src/app.py
 ```
 
 Output:
 
 - `dist/videoFrameSampler.exe`
+- Optional release batch: `build_release.bat`
 
 ## Documents
 

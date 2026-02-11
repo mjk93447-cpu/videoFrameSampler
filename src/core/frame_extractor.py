@@ -237,11 +237,25 @@ def _extract_with_cv2(
         frame_index = 0
         saved_count = 0
         failure_message = ""
+        if hasattr(cap, "get"):
+            fps = float(cap.get(cv2.CAP_PROP_FPS) or 30.0)
+        else:
+            fps = 30.0
+        prev_gray: np.ndarray | None = None
+        motion_scores: list[float] = []
 
         while True:
             ok, frame = cap.read()
             if not ok:
                 break
+
+            if motion_sampling and motion_sampling.enabled:
+                roi_for_motion = _apply_roi(frame, roi)
+                gray = cv2.cvtColor(roi_for_motion, cv2.COLOR_BGR2GRAY)
+                if prev_gray is not None:
+                    diff = cv2.absdiff(gray, prev_gray)
+                    motion_scores.append(float(np.mean(diff)))
+                prev_gray = gray
 
             if frame_index % interval == 0:
                 frame_to_save = _apply_roi(frame, roi)
@@ -273,18 +287,27 @@ def _extract_with_cv2(
             continue
 
         message = f"Completed with OpenCV backend: {backend_name}."
-        if motion_sampling and motion_sampling.enabled:
-            motion_result = _extract_motion_segment_with_cv2(
+        if motion_sampling and motion_sampling.enabled and motion_scores:
+            start_idx, end_idx = _find_major_motion_window(
+                motion_scores=motion_scores,
+                fps=fps,
+                expected_duration_sec=motion_sampling.normalized_duration_sec(),
+                tolerance_ratio=motion_sampling.normalized_tolerance_ratio(),
+            )
+            motion_result = _save_motion_segment_with_cv2(
                 video_path=video_path,
                 output_dir=output_dir,
                 image_format=image_format,
                 jpg_quality=jpg_quality,
                 roi=roi,
-                motion_sampling=motion_sampling,
+                start_idx=start_idx,
+                end_idx=end_idx,
                 backend_id=backend_id,
                 progress_cb=progress_cb,
             )
             message = f"{message} {motion_result}"
+        elif motion_sampling and motion_sampling.enabled:
+            message = f"{message} Motion sampling skipped: insufficient frames."
 
         return VideoExtractionResult(
             video_path=video_path,
@@ -756,70 +779,39 @@ def _extract_with_legacy_codec_bridge(
     )
 
 
-def _extract_motion_segment_with_cv2(
+def _save_motion_segment_with_cv2(
     video_path: Path,
     output_dir: Path,
     image_format: ImageFormat,
     jpg_quality: int,
     roi: RoiBox | None,
-    motion_sampling: MotionSamplingOptions,
+    start_idx: int,
+    end_idx: int,
     backend_id: int | None,
     progress_cb: ProgressCallback | None,
 ) -> str:
     cap = cv2.VideoCapture(str(video_path)) if backend_id is None else cv2.VideoCapture(str(video_path), backend_id)
     if not cap.isOpened():
         cap.release()
-        return "Motion sampling skipped: decode pass unavailable."
-
-    fps = float(cap.get(cv2.CAP_PROP_FPS) or 30.0)
-    prev_gray: np.ndarray | None = None
-    motion_scores: list[float] = []
-    frame_count = 0
-
-    while True:
-        ok, frame = cap.read()
-        if not ok:
-            break
-        roi_frame = _apply_roi(frame, roi)
-        gray = cv2.cvtColor(roi_frame, cv2.COLOR_BGR2GRAY)
-        if prev_gray is not None:
-            diff = cv2.absdiff(gray, prev_gray)
-            motion_scores.append(float(np.mean(diff)))
-        prev_gray = gray
-        frame_count += 1
-    cap.release()
-
-    if frame_count <= 1 or not motion_scores:
-        return "Motion sampling skipped: insufficient frames."
-
-    start_idx, end_idx = _find_major_motion_window(
-        motion_scores=motion_scores,
-        fps=fps,
-        expected_duration_sec=motion_sampling.normalized_duration_sec(),
-        tolerance_ratio=motion_sampling.normalized_tolerance_ratio(),
-    )
+        return "Motion sampling skipped: write pass unavailable."
 
     motion_dir = output_dir / "motion_segment"
     motion_dir.mkdir(parents=True, exist_ok=True)
     ext = ".jpg" if image_format == ImageFormat.JPG else ".png"
 
-    cap2 = cv2.VideoCapture(str(video_path)) if backend_id is None else cv2.VideoCapture(str(video_path), backend_id)
-    if not cap2.isOpened():
-        cap2.release()
-        return "Motion sampling skipped: write pass unavailable."
-
-    idx = 0
+    idx = start_idx
     saved = 0
+    cap.set(cv2.CAP_PROP_POS_FRAMES, float(start_idx))
     while True:
-        ok, frame = cap2.read()
+        ok, frame = cap.read()
         if not ok:
             break
-        if start_idx <= idx <= end_idx:
+        if idx <= end_idx:
             roi_frame = _apply_roi(frame, roi)
             filename = f"{video_path.stem}_motion_{saved:06d}{ext}"
             out_path = motion_dir / filename
             if not _save_frame(roi_frame, out_path, image_format, jpg_quality):
-                cap2.release()
+                cap.release()
                 return f"Motion sampling stopped: failed to save {out_path.name}."
             saved += 1
             if progress_cb and saved % 25 == 0:
@@ -827,7 +819,7 @@ def _extract_motion_segment_with_cv2(
         idx += 1
         if idx > end_idx:
             break
-    cap2.release()
+    cap.release()
     return f"Motion segment saved {saved} frame(s) in {motion_dir} (frame {start_idx}..{end_idx})."
 
 
