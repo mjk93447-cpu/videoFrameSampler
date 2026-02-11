@@ -907,7 +907,80 @@ def _extract_with_h264_salvage(
             rebuilt.extend(start_code + nal)
         return bytes(rebuilt)
 
-    def _collect_avcc_candidate_offsets(payload: bytes, annexb_candidates: list[tuple[int, str]]) -> list[int]:
+    def _scan_avcc_records(payload: bytes, max_records: int = 12) -> list[dict[str, object]]:
+        records: list[dict[str, object]] = []
+        size = len(payload)
+        for i in range(0, max(0, size - 12)):
+            if len(records) >= max_records:
+                break
+            if payload[i] != 0x01:
+                continue
+            # AVCDecoderConfigurationRecord signature checks.
+            if (payload[i + 4] & 0xFC) != 0xFC:
+                continue
+            if (payload[i + 5] & 0xE0) != 0xE0:
+                continue
+            pos = i + 6
+            num_sps = int(payload[i + 5] & 0x1F)
+            if num_sps <= 0 or num_sps > 16:
+                continue
+            sps_list: list[bytes] = []
+            valid = True
+            for _ in range(num_sps):
+                if pos + 2 > size:
+                    valid = False
+                    break
+                sps_len = int.from_bytes(payload[pos : pos + 2], "big", signed=False)
+                pos += 2
+                if sps_len <= 0 or sps_len > 2048 or pos + sps_len > size:
+                    valid = False
+                    break
+                sps = payload[pos : pos + sps_len]
+                pos += sps_len
+                if sps and (sps[0] & 0x1F) == 7:
+                    sps_list.append(bytes(sps))
+            if not valid or pos + 1 > size:
+                continue
+
+            num_pps = int(payload[pos])
+            pos += 1
+            if num_pps <= 0 or num_pps > 64:
+                continue
+            pps_list: list[bytes] = []
+            for _ in range(num_pps):
+                if pos + 2 > size:
+                    valid = False
+                    break
+                pps_len = int.from_bytes(payload[pos : pos + 2], "big", signed=False)
+                pos += 2
+                if pps_len <= 0 or pps_len > 2048 or pos + pps_len > size:
+                    valid = False
+                    break
+                pps = payload[pos : pos + pps_len]
+                pos += pps_len
+                if pps and (pps[0] & 0x1F) == 8:
+                    pps_list.append(bytes(pps))
+            if not valid:
+                continue
+            if not sps_list or not pps_list:
+                continue
+
+            records.append(
+                {
+                    "offset": i,
+                    "data_end": pos,
+                    "length_size": int((payload[i + 4] & 0x03) + 1),
+                    "sps": sps_list[0],
+                    "pps": pps_list[0],
+                }
+            )
+        return records
+
+    def _collect_avcc_candidate_offsets(
+        payload: bytes,
+        annexb_candidates: list[tuple[int, str]],
+        avcc_records: list[dict[str, object]],
+    ) -> list[int]:
         offsets: list[int] = []
         anchors = [off for off, _ in annexb_candidates]
         if anchors:
@@ -918,24 +991,37 @@ def _extract_with_h264_salvage(
                         offsets.append(cand)
         else:
             offsets.append(0)
+        for record in avcc_records:
+            end_pos = int(record.get("data_end", 0))
+            for delta in (0, 4, 8, 12):
+                cand = end_pos + delta
+                if 0 <= cand < len(payload):
+                    offsets.append(cand)
         dedup: list[int] = []
         for off in offsets:
             if off not in dedup:
                 dedup.append(off)
         return dedup[:24]
 
-    def _try_convert_avcc_to_annexb(payload: bytes, start_offset: int, max_units: int = 4000) -> tuple[bytes | None, str]:
-        if start_offset < 0 or start_offset + 5 >= len(payload):
+    def _try_convert_avcc_to_annexb(
+        payload: bytes,
+        start_offset: int,
+        nal_length_size: int,
+        max_units: int = 4000,
+    ) -> tuple[bytes | None, str]:
+        if start_offset < 0 or start_offset + nal_length_size + 1 >= len(payload):
             return None, "offset out of range"
+        if nal_length_size <= 0 or nal_length_size > 4:
+            return None, "invalid AVCC length size"
         pos = start_offset
         out = bytearray()
         units = 0
         idr_or_slice = 0
-        while pos + 4 <= len(payload) and units < max_units:
-            nal_len = int.from_bytes(payload[pos : pos + 4], "big", signed=False)
+        while pos + nal_length_size <= len(payload) and units < max_units:
+            nal_len = int.from_bytes(payload[pos : pos + nal_length_size], "big", signed=False)
             if nal_len <= 0 or nal_len > 2_000_000:
                 break
-            nal_start = pos + 4
+            nal_start = pos + nal_length_size
             nal_end = nal_start + nal_len
             if nal_end > len(payload):
                 break
@@ -956,7 +1042,7 @@ def _extract_with_h264_salvage(
             return None, "too few AVCC units"
         if idr_or_slice == 0:
             return None, "no decodable slices in AVCC units"
-        return bytes(out), f"units={units}, slices={idr_or_slice}"
+        return bytes(out), f"units={units}, slices={idr_or_slice}, len_size={nal_length_size}"
 
     candidates = _collect_h264_candidate_offsets(raw)
 
@@ -974,6 +1060,10 @@ def _extract_with_h264_salvage(
         )
 
     sps, pps = _extract_sps_pps(raw)
+    avcc_records = _scan_avcc_records(raw)
+    if avcc_records and (sps is None or pps is None):
+        sps = bytes(avcc_records[0]["sps"]) if sps is None else sps
+        pps = bytes(avcc_records[0]["pps"]) if pps is None else pps
     if progress_cb:
         progress_cb(
             "[salvage] SPS/PPS scan: "
@@ -981,6 +1071,9 @@ def _extract_with_h264_salvage(
             + ", "
             + ("found PPS" if pps is not None else "no PPS")
         )
+        if avcc_records:
+            length_sizes = ",".join(str(int(item.get("length_size", 0))) for item in avcc_records[:6])
+            progress_cb(f"[salvage] avcC records detected: {len(avcc_records)} (len_size={length_sizes})")
 
     with tempfile.TemporaryDirectory() as tmp:
         tmp_dir = Path(tmp)
@@ -1057,37 +1150,48 @@ def _extract_with_h264_salvage(
                         f"rebuild_{candidate_label}@{candidate_offset}: {rebuilt_details}"
                     )
         if not extracted:
-            avcc_offsets = _collect_avcc_candidate_offsets(raw, candidates)
+            preferred_len_sizes = [int(rec.get("length_size", 4)) for rec in avcc_records]
+            avcc_len_sizes: list[int] = []
+            for size in preferred_len_sizes + [4, 2, 1, 3]:
+                if size not in avcc_len_sizes:
+                    avcc_len_sizes.append(size)
+
+            avcc_offsets = _collect_avcc_candidate_offsets(raw, candidates, avcc_records)
             for avcc_offset in avcc_offsets:
-                if progress_cb:
-                    progress_cb(f"[salvage] Trying AVCC length-prefixed conversion at offset {avcc_offset}.")
-                converted, convert_info = _try_convert_avcc_to_annexb(raw, avcc_offset)
-                if converted is None:
-                    attempt_errors.append(f"avcc@{avcc_offset}: {convert_info}")
-                    continue
-                for stale in tmp_dir.glob(f"salvage_*{ext}"):
-                    stale.unlink(missing_ok=True)
-                avcc_path = tmp_dir / f"{video_path.stem}_salvage_avcc_{avcc_offset}.h264"
-                avcc_path.write_bytes(converted)
-                avcc_run = _run_ffmpeg_recovery_attempt(
-                    ffmpeg_exe=str(ffmpeg_exe),
-                    video_path=avcc_path,
-                    pattern_path=pattern_path,
-                    interval=interval,
-                    image_format=image_format,
-                    jpg_quality=jpg_quality,
-                    input_params=FFMPEG_RELAXED_INPUT_PARAMS,
-                    forced_format="h264",
-                    decoder_tuning_args=["-max_error_rate", "1", "-flags2", "+showall"],
-                )
-                extracted = sorted(tmp_dir.glob(f"salvage_*{ext}"))
+                for len_size in avcc_len_sizes:
+                    if progress_cb:
+                        progress_cb(
+                            f"[salvage] Trying AVCC length-prefixed conversion at offset {avcc_offset} (len={len_size})."
+                        )
+                    converted, convert_info = _try_convert_avcc_to_annexb(raw, avcc_offset, len_size)
+                    if converted is None:
+                        attempt_errors.append(f"avcc@{avcc_offset}/len{len_size}: {convert_info}")
+                        continue
+                    for stale in tmp_dir.glob(f"salvage_*{ext}"):
+                        stale.unlink(missing_ok=True)
+                    avcc_path = tmp_dir / f"{video_path.stem}_salvage_avcc_{avcc_offset}_l{len_size}.h264"
+                    avcc_path.write_bytes(converted)
+                    avcc_run = _run_ffmpeg_recovery_attempt(
+                        ffmpeg_exe=str(ffmpeg_exe),
+                        video_path=avcc_path,
+                        pattern_path=pattern_path,
+                        interval=interval,
+                        image_format=image_format,
+                        jpg_quality=jpg_quality,
+                        input_params=FFMPEG_RELAXED_INPUT_PARAMS,
+                        forced_format="h264",
+                        decoder_tuning_args=["-max_error_rate", "1", "-flags2", "+showall"],
+                    )
+                    extracted = sorted(tmp_dir.glob(f"salvage_*{ext}"))
+                    if extracted:
+                        success_mode = f"avcc_{avcc_offset}_l{len_size}({convert_info})"
+                        break
+                    avcc_stderr = (avcc_run.stderr or "").strip()
+                    avcc_stdout = (avcc_run.stdout or "").strip()
+                    avcc_details = avcc_stderr or avcc_stdout or f"ffmpeg return code {avcc_run.returncode}"
+                    attempt_errors.append(f"avcc@{avcc_offset}/len{len_size}: {avcc_details}")
                 if extracted:
-                    success_mode = f"avcc_{avcc_offset}({convert_info})"
                     break
-                avcc_stderr = (avcc_run.stderr or "").strip()
-                avcc_stdout = (avcc_run.stdout or "").strip()
-                avcc_details = avcc_stderr or avcc_stdout or f"ffmpeg return code {avcc_run.returncode}"
-                attempt_errors.append(f"avcc@{avcc_offset}: {avcc_details}")
 
         if not extracted:
             return VideoExtractionResult(
