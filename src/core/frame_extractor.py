@@ -907,16 +907,58 @@ def _extract_with_h264_salvage(
             rebuilt.extend(start_code + nal)
         return bytes(rebuilt)
 
+    def _collect_avcc_candidate_offsets(payload: bytes, annexb_candidates: list[tuple[int, str]]) -> list[int]:
+        offsets: list[int] = []
+        anchors = [off for off, _ in annexb_candidates]
+        if anchors:
+            for base in anchors:
+                for delta in (0, 4, 8, 12, 16, 24, 32):
+                    cand = base - delta
+                    if cand >= 0:
+                        offsets.append(cand)
+        else:
+            offsets.append(0)
+        dedup: list[int] = []
+        for off in offsets:
+            if off not in dedup:
+                dedup.append(off)
+        return dedup[:24]
+
+    def _try_convert_avcc_to_annexb(payload: bytes, start_offset: int, max_units: int = 4000) -> tuple[bytes | None, str]:
+        if start_offset < 0 or start_offset + 5 >= len(payload):
+            return None, "offset out of range"
+        pos = start_offset
+        out = bytearray()
+        units = 0
+        idr_or_slice = 0
+        while pos + 4 <= len(payload) and units < max_units:
+            nal_len = int.from_bytes(payload[pos : pos + 4], "big", signed=False)
+            if nal_len <= 0 or nal_len > 2_000_000:
+                break
+            nal_start = pos + 4
+            nal_end = nal_start + nal_len
+            if nal_end > len(payload):
+                break
+            nal = payload[nal_start:nal_end]
+            if not nal:
+                break
+            nal_type = int(nal[0] & 0x1F)
+            if nal_type <= 0 or nal_type > 31:
+                break
+            if nal_type in (1, 5):
+                idr_or_slice += 1
+            out.extend(b"\x00\x00\x00\x01")
+            out.extend(nal)
+            units += 1
+            pos = nal_end
+
+        if units < 3:
+            return None, "too few AVCC units"
+        if idr_or_slice == 0:
+            return None, "no decodable slices in AVCC units"
+        return bytes(out), f"units={units}, slices={idr_or_slice}"
+
     candidates = _collect_h264_candidate_offsets(raw)
-    if not candidates:
-        return VideoExtractionResult(
-            video_path=video_path,
-            output_dir=output_dir,
-            saved_count=0,
-            total_frames_seen=0,
-            success=False,
-            message="H264 salvage failed: no Annex-B start code found.",
-        )
 
     try:
         imageio_ffmpeg = importlib.import_module("imageio_ffmpeg")
@@ -947,6 +989,8 @@ def _extract_with_h264_salvage(
         extracted: list[Path] = []
         success_mode = "raw"
 
+        if not candidates:
+            attempt_errors.append("annexb: no start code candidates")
         for candidate_offset, candidate_label in candidates:
             if progress_cb:
                 progress_cb(
@@ -1012,6 +1056,38 @@ def _extract_with_h264_salvage(
                     attempt_errors.append(
                         f"rebuild_{candidate_label}@{candidate_offset}: {rebuilt_details}"
                     )
+        if not extracted:
+            avcc_offsets = _collect_avcc_candidate_offsets(raw, candidates)
+            for avcc_offset in avcc_offsets:
+                if progress_cb:
+                    progress_cb(f"[salvage] Trying AVCC length-prefixed conversion at offset {avcc_offset}.")
+                converted, convert_info = _try_convert_avcc_to_annexb(raw, avcc_offset)
+                if converted is None:
+                    attempt_errors.append(f"avcc@{avcc_offset}: {convert_info}")
+                    continue
+                for stale in tmp_dir.glob(f"salvage_*{ext}"):
+                    stale.unlink(missing_ok=True)
+                avcc_path = tmp_dir / f"{video_path.stem}_salvage_avcc_{avcc_offset}.h264"
+                avcc_path.write_bytes(converted)
+                avcc_run = _run_ffmpeg_recovery_attempt(
+                    ffmpeg_exe=str(ffmpeg_exe),
+                    video_path=avcc_path,
+                    pattern_path=pattern_path,
+                    interval=interval,
+                    image_format=image_format,
+                    jpg_quality=jpg_quality,
+                    input_params=FFMPEG_RELAXED_INPUT_PARAMS,
+                    forced_format="h264",
+                    decoder_tuning_args=["-max_error_rate", "1", "-flags2", "+showall"],
+                )
+                extracted = sorted(tmp_dir.glob(f"salvage_*{ext}"))
+                if extracted:
+                    success_mode = f"avcc_{avcc_offset}({convert_info})"
+                    break
+                avcc_stderr = (avcc_run.stderr or "").strip()
+                avcc_stdout = (avcc_run.stdout or "").strip()
+                avcc_details = avcc_stderr or avcc_stdout or f"ffmpeg return code {avcc_run.returncode}"
+                attempt_errors.append(f"avcc@{avcc_offset}: {avcc_details}")
 
         if not extracted:
             return VideoExtractionResult(

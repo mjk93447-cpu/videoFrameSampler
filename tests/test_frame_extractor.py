@@ -645,6 +645,79 @@ def test_h264_salvage_uses_sps_pps_reconstruction_route(
     assert attempts["rebuild"] >= 1
 
 
+def test_h264_salvage_supports_avcc_length_prefixed_stream(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    out_dir = tmp_path / "out_salvage_avcc"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    video_path = tmp_path / "wrapped_avcc.bin"
+
+    # AVCC-like payload: [len][NAL] repeated, without Annex-B start codes.
+    sps = b"\x67\x64\x00\x1f"
+    pps = b"\x68\xee\x3c\x80"
+    idr = b"\x65\x88\x99\xaa\xbb"
+    payload = (
+        len(sps).to_bytes(4, "big")
+        + sps
+        + len(pps).to_bytes(4, "big")
+        + pps
+        + len(idr).to_bytes(4, "big")
+        + idr
+    )
+    video_path.write_bytes(payload)
+
+    real_import_module = frame_extractor.importlib.import_module
+    real_subprocess_run = frame_extractor.subprocess.run
+
+    class FakeImageioFfmpeg:
+        @staticmethod
+        def get_ffmpeg_exe() -> str:
+            return "ffmpeg"
+
+    def fake_import_module(name: str):
+        if name == "imageio_ffmpeg":
+            return FakeImageioFfmpeg
+        return real_import_module(name)
+
+    seen_inputs: list[str] = []
+
+    def fake_run(cmd, capture_output, text, encoding, errors):
+        input_path = Path(cmd[cmd.index("-i") + 1])
+        seen_inputs.append(input_path.name)
+        pattern = Path(cmd[-1])
+        pattern.parent.mkdir(parents=True, exist_ok=True)
+        # Only converted AVCC temp stream should succeed.
+        if "_salvage_avcc_" not in input_path.name:
+            return subprocess.CompletedProcess(cmd, 1, "", "invalid data")
+        img = np.zeros((80, 120, 3), dtype=np.uint8)
+        ok, encoded = cv2.imencode(".png", img)
+        assert ok
+        encoded.tofile(str(pattern.parent / "salvage_000000.png"))
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(frame_extractor.importlib, "import_module", fake_import_module)
+    monkeypatch.setattr(frame_extractor.subprocess, "run", fake_run)
+
+    try:
+        result = frame_extractor._extract_with_h264_salvage(
+            video_path=video_path,
+            output_dir=out_dir,
+            interval=2,
+            image_format=ImageFormat.PNG,
+            jpg_quality=95,
+            roi=None,
+            progress_cb=None,
+        )
+    finally:
+        monkeypatch.setattr(frame_extractor.importlib, "import_module", real_import_module)
+        monkeypatch.setattr(frame_extractor.subprocess, "run", real_subprocess_run)
+
+    assert result.success is True
+    assert result.saved_count == 1
+    assert "avcc_" in result.message
+    assert any("_salvage_avcc_" in name for name in seen_inputs)
+
+
 def test_extract_video_frames_applies_roi_crop(tmp_path: Path) -> None:
     _clean_output_dir()
     video_path = create_synthetic_video(tmp_path / "roi_source.mp4", frame_count=8, width=200, height=120, fourcc="mp4v")
