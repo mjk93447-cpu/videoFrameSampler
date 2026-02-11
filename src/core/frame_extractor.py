@@ -14,6 +14,17 @@ from core.models import ExtractionOptions, ImageFormat, VideoExtractionResult
 
 ProgressCallback = Callable[[str], None]
 
+FFMPEG_TOLERANT_INPUT_PARAMS: list[str] = [
+    "-err_detect",
+    "ignore_err",
+    "-fflags",
+    "+genpts+igndts+discardcorrupt",
+    "-analyzeduration",
+    "200M",
+    "-probesize",
+    "200M",
+]
+
 
 def get_runtime_base_dir() -> Path:
     if getattr(sys, "frozen", False):
@@ -184,7 +195,11 @@ def _extract_with_imageio_fallback(
         )
 
     try:
-        with imageio.get_reader(str(video_path), format="ffmpeg") as reader:
+        with imageio.get_reader(
+            str(video_path),
+            format="ffmpeg",
+            input_params=FFMPEG_TOLERANT_INPUT_PARAMS,
+        ) as reader:
             for frame in reader:
                 if frame_index % interval == 0:
                     # imageio returns RGB arrays; convert to BGR for cv2 encoding.
@@ -274,14 +289,7 @@ def _extract_with_ffmpeg_recovery(
         "-hide_banner",
         "-loglevel",
         "error",
-        "-err_detect",
-        "ignore_err",
-        "-fflags",
-        "+genpts+igndts+discardcorrupt",
-        "-analyzeduration",
-        "200M",
-        "-probesize",
-        "200M",
+        *FFMPEG_TOLERANT_INPUT_PARAMS,
         "-i",
         str(video_path),
         "-vf",

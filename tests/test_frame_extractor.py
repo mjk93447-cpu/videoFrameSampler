@@ -119,6 +119,66 @@ def test_extract_video_frames_uses_fallback_when_cv2_cannot_open(tmp_path: Path,
     assert "fallback" in result.message.lower()
 
 
+def test_fallback_reader_uses_tolerant_ffmpeg_input_params(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _clean_output_dir()
+    video_path = create_synthetic_video(tmp_path / "fallback_tolerant.mp4", frame_count=8, fourcc="mp4v")
+    options = ExtractionOptions(interval=2, image_format=ImageFormat.PNG)
+
+    real_video_capture = frame_extractor.cv2.VideoCapture
+    real_import_module = frame_extractor.importlib.import_module
+    captured: dict[str, object] = {}
+
+    class FakeCapture:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def isOpened(self) -> bool:
+            return False
+
+        def release(self) -> None:
+            return None
+
+    class FakeReader:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def __iter__(self):
+            for _ in range(3):
+                frame = np.zeros((60, 90, 3), dtype=np.uint8)
+                frame[:, :, 0] = 120
+                yield frame
+
+    class FakeImageio:
+        @staticmethod
+        def get_reader(path: str, format: str, input_params: list[str]):
+            captured["path"] = path
+            captured["format"] = format
+            captured["input_params"] = input_params
+            return FakeReader()
+
+    def fake_import_module(name: str):
+        if name == "imageio":
+            return FakeImageio
+        return real_import_module(name)
+
+    monkeypatch.setattr(frame_extractor.cv2, "VideoCapture", FakeCapture)
+    monkeypatch.setattr(frame_extractor.importlib, "import_module", fake_import_module)
+    try:
+        result = extract_video_frames(video_path, options)
+    finally:
+        monkeypatch.setattr(frame_extractor.cv2, "VideoCapture", real_video_capture)
+        monkeypatch.setattr(frame_extractor.importlib, "import_module", real_import_module)
+
+    assert result.success is True
+    assert result.saved_count == 2
+    assert captured["path"] == str(video_path)
+    assert captured["format"] == "ffmpeg"
+    assert captured["input_params"] == frame_extractor.FFMPEG_TOLERANT_INPUT_PARAMS
+
+
 def test_fallback_unavailable_does_not_crash(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     _clean_output_dir()
     video_path = create_synthetic_video(tmp_path / "fallback_missing.mp4", frame_count=8, fourcc="mp4v")
