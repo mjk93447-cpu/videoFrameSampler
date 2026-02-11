@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from core.frame_extractor import (  # noqa: E402
     CV2_BACKEND_ORDER,
+    FFMPEG_FORCED_INPUT_FORMATS,
     _extract_with_ffmpeg_recovery,
     collect_decode_diagnostics,
     extract_video_frames,
@@ -346,3 +347,58 @@ def test_collect_decode_diagnostics_reports_repeat_runs(tmp_path: Path) -> None:
     assert len(runs) == 2
     assert all("progress_log" in run for run in runs)
     assert all("success" in run for run in runs)
+
+
+def test_ffmpeg_recovery_tries_forced_input_formats_when_auto_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    out_dir = tmp_path / "out_forced"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    video_path = tmp_path / "legacy_like.avi"
+    video_path.write_bytes(b"dummy")
+
+    real_import_module = frame_extractor.importlib.import_module
+    real_subprocess_run = frame_extractor.subprocess.run
+
+    class FakeImageioFfmpeg:
+        @staticmethod
+        def get_ffmpeg_exe() -> str:
+            return "ffmpeg"
+
+    def fake_import_module(name: str):
+        if name == "imageio_ffmpeg":
+            return FakeImageioFfmpeg
+        return real_import_module(name)
+
+    def fake_run(cmd, capture_output, text, encoding, errors):
+        pattern = Path(cmd[-1])
+        use_forced_asf = "-f" in cmd and "asf" in cmd
+        if use_forced_asf:
+            pattern.parent.mkdir(parents=True, exist_ok=True)
+            img = np.zeros((80, 120, 3), dtype=np.uint8)
+            ok, encoded = cv2.imencode(".png", img)
+            assert ok
+            encoded.tofile(str(pattern.parent / "frame_000000.png"))
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+        return subprocess.CompletedProcess(cmd, 1, "", "invalid data")
+
+    monkeypatch.setattr(frame_extractor.importlib, "import_module", fake_import_module)
+    monkeypatch.setattr(frame_extractor.subprocess, "run", fake_run)
+
+    try:
+        result = _extract_with_ffmpeg_recovery(
+            video_path=video_path,
+            output_dir=out_dir,
+            interval=2,
+            image_format=ImageFormat.PNG,
+            jpg_quality=95,
+            progress_cb=None,
+        )
+    finally:
+        monkeypatch.setattr(frame_extractor.importlib, "import_module", real_import_module)
+        monkeypatch.setattr(frame_extractor.subprocess, "run", real_subprocess_run)
+
+    assert "asf" in FFMPEG_FORCED_INPUT_FORMATS
+    assert result.success is True
+    assert result.saved_count == 1
+    assert "recovery ffmpeg decoder (asf)" in result.message.lower()

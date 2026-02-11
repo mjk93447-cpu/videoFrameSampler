@@ -28,6 +28,15 @@ FFMPEG_TOLERANT_INPUT_PARAMS: list[str] = [
     "200M",
 ]
 
+FFMPEG_FORCED_INPUT_FORMATS: tuple[str, ...] = (
+    "avi",
+    "asf",
+    "mpegts",
+    "mov",
+    "matroska",
+    "h264",
+)
+
 CV2_BACKEND_ORDER: tuple[str, ...] = (
     "default",
     # Prefer legacy Windows system decoders before OpenCV ffmpeg backend.
@@ -272,6 +281,40 @@ def _jpg_quality_to_ffmpeg_qscale(jpg_quality: int) -> int:
     return int(round(((100 - q) / 99) * 29 + 2))
 
 
+def _run_ffmpeg_recovery_attempt(
+    ffmpeg_exe: str,
+    video_path: Path,
+    pattern_path: Path,
+    interval: int,
+    image_format: ImageFormat,
+    jpg_quality: int,
+    forced_format: str | None = None,
+) -> subprocess.CompletedProcess[str]:
+    cmd: list[str] = [
+        str(ffmpeg_exe),
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        *FFMPEG_TOLERANT_INPUT_PARAMS,
+    ]
+    if forced_format:
+        cmd.extend(["-f", forced_format])
+    cmd.extend(
+        [
+            "-i",
+            str(video_path),
+            "-vf",
+            f"select=not(mod(n\\,{interval}))",
+            "-vsync",
+            "vfr",
+        ]
+    )
+    if image_format == ImageFormat.JPG:
+        cmd.extend(["-q:v", str(_jpg_quality_to_ffmpeg_qscale(jpg_quality))])
+    cmd.extend(["-y", str(pattern_path)])
+    return subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="ignore")
+
+
 def _extract_with_ffmpeg_recovery(
     video_path: Path,
     output_dir: Path,
@@ -299,30 +342,35 @@ def _extract_with_ffmpeg_recovery(
             message=f"Recovery backend is unavailable: {exc}",
         )
 
-    cmd: list[str] = [
-        str(ffmpeg_exe),
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        *FFMPEG_TOLERANT_INPUT_PARAMS,
-        "-i",
-        str(video_path),
-        "-vf",
-        f"select=not(mod(n\\,{interval}))",
-        "-vsync",
-        "vfr",
-    ]
-    if image_format == ImageFormat.JPG:
-        cmd.extend(["-q:v", str(_jpg_quality_to_ffmpeg_qscale(jpg_quality))])
-    cmd.extend(["-y", str(pattern_path)])
+    attempt_errors: list[str] = []
+    attempts: list[str | None] = [None, *FFMPEG_FORCED_INPUT_FORMATS]
+    success_label = "auto"
 
-    run = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="ignore")
+    for forced_format in attempts:
+        if progress_cb and forced_format:
+            progress_cb(f"[recovery] Trying forced input format: {forced_format}")
 
-    extracted = sorted(tmp_dir.glob(f"frame_*{ext}"))
-    if not extracted:
+        run = _run_ffmpeg_recovery_attempt(
+            ffmpeg_exe=str(ffmpeg_exe),
+            video_path=video_path,
+            pattern_path=pattern_path,
+            interval=interval,
+            image_format=image_format,
+            jpg_quality=jpg_quality,
+            forced_format=forced_format,
+        )
+
+        extracted = sorted(tmp_dir.glob(f"frame_*{ext}"))
+        if extracted:
+            success_label = forced_format or "auto"
+            break
+
         stderr = (run.stderr or "").strip()
         stdout = (run.stdout or "").strip()
         details = stderr or stdout or f"ffmpeg return code {run.returncode}"
+        tag = forced_format or "auto"
+        attempt_errors.append(f"{tag}: {details}")
+    else:
         shutil.rmtree(tmp_dir, ignore_errors=True)
         return VideoExtractionResult(
             video_path=video_path,
@@ -330,7 +378,7 @@ def _extract_with_ffmpeg_recovery(
             saved_count=0,
             total_frames_seen=0,
             success=False,
-            message=f"Recovery decoder failed: {details}",
+            message=f"Recovery decoder failed: {' | '.join(attempt_errors)}",
         )
 
     for idx, src_path in enumerate(extracted):
@@ -346,7 +394,7 @@ def _extract_with_ffmpeg_recovery(
         saved_count=len(extracted),
         total_frames_seen=-1,
         success=True,
-        message="Completed with recovery ffmpeg decoder.",
+        message=f"Completed with recovery ffmpeg decoder ({success_label}).",
     )
 
 
@@ -513,29 +561,46 @@ def _probe_recovery_ffmpeg(video_path: Path) -> dict[str, object]:
 
     with tempfile.TemporaryDirectory() as tmp:
         sample_out = Path(tmp) / "sample_%06d.jpg"
-        cmd = [
-            str(ffmpeg_exe),
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            *FFMPEG_TOLERANT_INPUT_PARAMS,
-            "-i",
-            str(video_path),
-            "-frames:v",
-            "1",
-            "-q:v",
-            "2",
-            "-y",
-            str(sample_out),
-        ]
-        run = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="ignore")
-        extracted = list(Path(tmp).glob("sample_*.jpg"))
+        runs: list[dict[str, object]] = []
+        for forced_format in (None, *FFMPEG_FORCED_INPUT_FORMATS):
+            cmd = [
+                str(ffmpeg_exe),
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                *FFMPEG_TOLERANT_INPUT_PARAMS,
+            ]
+            if forced_format:
+                cmd.extend(["-f", forced_format])
+            cmd.extend(
+                [
+                    "-i",
+                    str(video_path),
+                    "-frames:v",
+                    "1",
+                    "-q:v",
+                    "2",
+                    "-y",
+                    str(sample_out),
+                ]
+            )
+            run = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="ignore")
+            extracted = list(Path(tmp).glob("sample_*.jpg"))
+            runs.append(
+                {
+                    "format": forced_format or "auto",
+                    "returncode": run.returncode,
+                    "stdout": (run.stdout or "").strip(),
+                    "stderr": (run.stderr or "").strip(),
+                    "extracted_first_frame": bool(extracted),
+                }
+            )
+            if extracted:
+                break
         return {
             "available": True,
-            "returncode": run.returncode,
-            "stdout": (run.stdout or "").strip(),
-            "stderr": (run.stderr or "").strip(),
-            "extracted_first_frame": bool(extracted),
+            "attempts": runs,
+            "extracted_first_frame": any(bool(item.get("extracted_first_frame")) for item in runs),
         }
 
 
