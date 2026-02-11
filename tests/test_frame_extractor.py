@@ -24,7 +24,7 @@ from core.frame_extractor import (  # noqa: E402
     suggest_fast_mode_interval,
 )
 import core.frame_extractor as frame_extractor  # noqa: E402
-from core.models import ExtractionOptions, ImageFormat, MotionSamplingOptions, RoiBox  # noqa: E402
+from core.models import ExtractionOptions, ImageFormat, MotionSamplingOptions, RoiBox, VideoExtractionResult  # noqa: E402
 from tests.generate_test_video import create_synthetic_video  # noqa: E402
 
 
@@ -548,3 +548,87 @@ def test_extract_video_frames_saves_motion_segment(tmp_path: Path) -> None:
     files = sorted(motion_dir.glob("*.jpg"))
     assert files
     assert len(files) >= 1
+
+
+def test_extract_video_frames_uses_repair_pipeline_when_recovery_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _clean_output_dir()
+    video_path = tmp_path / "broken_input.avi"
+    video_path.write_bytes(b"broken")
+    options = ExtractionOptions(interval=2, image_format=ImageFormat.PNG)
+
+    real_cv2_extract = frame_extractor._extract_with_cv2
+    real_imageio_extract = frame_extractor._extract_with_imageio_fallback
+    real_recovery_extract = frame_extractor._extract_with_ffmpeg_recovery
+    real_repair = frame_extractor._repair_video_with_ffmpeg
+    real_salvage = frame_extractor._extract_with_h264_salvage
+
+    state = {"cv2_calls": 0}
+
+    def fake_cv2(video_path, output_dir, interval, image_format, jpg_quality, roi, motion_sampling, progress_cb):
+        state["cv2_calls"] += 1
+        if state["cv2_calls"] == 1:
+            return None
+        return VideoExtractionResult(
+            video_path=Path(video_path),
+            output_dir=output_dir,
+            saved_count=2,
+            total_frames_seen=20,
+            success=True,
+            message="Repaired decode success.",
+        )
+
+    def fake_imageio(*_args, **_kwargs):
+        return VideoExtractionResult(
+            video_path=video_path,
+            output_dir=Path.cwd() / "output" / "broken_input",
+            saved_count=0,
+            total_frames_seen=0,
+            success=False,
+            message="fallback failed",
+        )
+
+    def fake_recovery(*_args, **_kwargs):
+        return VideoExtractionResult(
+            video_path=video_path,
+            output_dir=Path.cwd() / "output" / "broken_input",
+            saved_count=0,
+            total_frames_seen=0,
+            success=False,
+            message="recovery failed",
+        )
+
+    def fake_repair(video_path, output_dir, progress_cb):
+        repaired_path = output_dir / "__repaired_video_tmp" / "broken_input__repaired.mp4"
+        repaired_path.parent.mkdir(parents=True, exist_ok=True)
+        repaired_path.write_bytes(b"fake repaired")
+        return repaired_path, "Repaired video created with profile repair_aggressive_auto."
+
+    def fake_salvage(*_args, **_kwargs):
+        return VideoExtractionResult(
+            video_path=video_path,
+            output_dir=Path.cwd() / "output" / "broken_input",
+            saved_count=0,
+            total_frames_seen=0,
+            success=False,
+            message="salvage failed",
+        )
+
+    monkeypatch.setattr(frame_extractor, "_extract_with_cv2", fake_cv2)
+    monkeypatch.setattr(frame_extractor, "_extract_with_imageio_fallback", fake_imageio)
+    monkeypatch.setattr(frame_extractor, "_extract_with_ffmpeg_recovery", fake_recovery)
+    monkeypatch.setattr(frame_extractor, "_repair_video_with_ffmpeg", fake_repair)
+    monkeypatch.setattr(frame_extractor, "_extract_with_h264_salvage", fake_salvage)
+    try:
+        result = frame_extractor.extract_video_frames(video_path, options)
+    finally:
+        monkeypatch.setattr(frame_extractor, "_extract_with_cv2", real_cv2_extract)
+        monkeypatch.setattr(frame_extractor, "_extract_with_imageio_fallback", real_imageio_extract)
+        monkeypatch.setattr(frame_extractor, "_extract_with_ffmpeg_recovery", real_recovery_extract)
+        monkeypatch.setattr(frame_extractor, "_repair_video_with_ffmpeg", real_repair)
+        monkeypatch.setattr(frame_extractor, "_extract_with_h264_salvage", real_salvage)
+
+    assert result.success is True
+    assert result.saved_count == 2
+    assert "repaired video created" in result.message.lower()

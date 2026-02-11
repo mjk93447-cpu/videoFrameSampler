@@ -11,14 +11,15 @@ Windows desktop application for offline video frame extraction with ROI and moti
   - Save only cropped ROI frames for performance and storage efficiency.
 - Motion segment sampling:
   - Detect frame-to-frame motion intensity.
-  - Auto-select one major continuous segment near the requested duration (+/-10%).
+  - Auto-select one major continuous segment near the requested duration.
+  - User-adjustable tolerance range (percent) for segment length.
   - Save contiguous frames into `output/<video_name>/motion_segment`.
 - Standard interval extraction:
   - Custom interval (`N`), output format (`PNG`/`JPG`), JPG quality.
 - Fast mode:
   - Auto-select JPG and suggest interval from first video metadata.
 - Robust decode fallback pipeline:
-  - OpenCV backends -> imageio ffmpeg -> forced format profiles -> aggressive profiles -> raw H264 salvage.
+  - OpenCV backends -> imageio ffmpeg -> forced format profiles -> aggressive profiles -> repair transcode -> raw H264 salvage.
 
 ## Tech Stack
 

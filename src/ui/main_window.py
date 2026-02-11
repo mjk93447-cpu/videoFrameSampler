@@ -245,11 +245,10 @@ class MainWindow(QMainWindow):
         self.roi_label = QLabel("ROI: full frame")
 
         self.motion_checkbox = QCheckBox("Enable motion segment sampling")
-        self.motion_checkbox.stateChanged.connect(
-            lambda _state: self.motion_duration_input.setEnabled(self.motion_checkbox.isChecked())
-        )
         self.motion_duration_input = QLineEdit("2.0")
         self.motion_duration_input.setPlaceholderText("Target duration in seconds (e.g. 2.0)")
+        self.motion_tolerance_input = QLineEdit("10")
+        self.motion_tolerance_input.setPlaceholderText("Tolerance percent, e.g. 10")
         self.motion_hint = QLabel(
             "Detect one major motion segment and save contiguous frames to output/<video>/motion_segment."
         )
@@ -269,8 +268,10 @@ class MainWindow(QMainWindow):
         controls_layout.addWidget(self.roi_label, 7, 0, 1, 3)
         controls_layout.addWidget(self.motion_checkbox, 8, 0, 1, 3)
         controls_layout.addWidget(QLabel("Motion target duration (sec)"), 9, 0)
-        controls_layout.addWidget(self.motion_duration_input, 9, 1, 1, 2)
-        controls_layout.addWidget(self.motion_hint, 10, 0, 1, 3)
+        controls_layout.addWidget(self.motion_duration_input, 9, 1)
+        controls_layout.addWidget(QLabel("Tolerance (%)"), 9, 2)
+        controls_layout.addWidget(self.motion_tolerance_input, 9, 3)
+        controls_layout.addWidget(self.motion_hint, 10, 0, 1, 4)
         layout.addWidget(controls)
 
         action_row = QHBoxLayout()
@@ -294,7 +295,6 @@ class MainWindow(QMainWindow):
 
         self.setCentralWidget(central)
         self._update_jpg_ui_state(self.format_combo.currentText())
-        self.motion_duration_input.setEnabled(self.motion_checkbox.isChecked())
 
     def _append_log(self, message: str) -> None:
         self.log_view.append(message)
@@ -349,9 +349,11 @@ class MainWindow(QMainWindow):
             return
         self.selected_roi = dialog.selected_roi
         if self.selected_roi is None:
+            self.roi_checkbox.setChecked(False)
             self.roi_label.setText("ROI: full frame")
             self._append_log("ROI cleared. Full frame extraction is active.")
         else:
+            self.roi_checkbox.setChecked(True)
             roi = self.selected_roi
             self.roi_label.setText(f"ROI: x={roi.x}, y={roi.y}, w={roi.width}, h={roi.height}")
             self._append_log(f"ROI updated: x={roi.x}, y={roi.y}, width={roi.width}, height={roi.height}")
@@ -384,10 +386,21 @@ class MainWindow(QMainWindow):
                 duration = float(self.motion_duration_input.text().strip())
                 if duration <= 0:
                     raise ValueError
+                tolerance_pct = float(self.motion_tolerance_input.text().strip())
+                if tolerance_pct <= 0 or tolerance_pct >= 95:
+                    raise ValueError
             except ValueError:
-                QMessageBox.warning(self, "Invalid duration", "Motion duration must be a positive number.")
+                QMessageBox.warning(
+                    self,
+                    "Invalid motion parameters",
+                    "Duration must be positive and tolerance must be between 1 and 95.",
+                )
                 return None
-            motion_sampling = MotionSamplingOptions(enabled=True, expected_duration_sec=duration)
+            motion_sampling = MotionSamplingOptions(
+                enabled=True,
+                expected_duration_sec=duration,
+                tolerance_ratio=tolerance_pct / 100.0,
+            )
 
         roi = self.selected_roi if self.roi_checkbox.isChecked() else None
 
@@ -409,7 +422,8 @@ class MainWindow(QMainWindow):
         self.roi_checkbox.setEnabled(enabled)
         self.roi_button.setEnabled(enabled)
         self.motion_checkbox.setEnabled(enabled)
-        self.motion_duration_input.setEnabled(enabled and self.motion_checkbox.isChecked())
+        self.motion_duration_input.setEnabled(enabled)
+        self.motion_tolerance_input.setEnabled(enabled)
         self.format_combo.setEnabled(enabled)
         self.jpg_quality_slider.setEnabled(enabled and self.format_combo.currentText() == "JPG")
 

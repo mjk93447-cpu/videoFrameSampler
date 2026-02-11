@@ -30,9 +30,13 @@ class RoiBox:
 class MotionSamplingOptions:
     enabled: bool = False
     expected_duration_sec: float = 2.0
+    tolerance_ratio: float = 0.10
 
     def normalized_duration_sec(self) -> float:
         return max(0.2, float(self.expected_duration_sec))
+
+    def normalized_tolerance_ratio(self) -> float:
+        return min(0.95, max(0.01, float(self.tolerance_ratio)))
 
 
 @dataclass(slots=True)

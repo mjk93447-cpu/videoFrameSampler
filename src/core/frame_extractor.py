@@ -169,12 +169,17 @@ def _apply_roi(frame: np.ndarray, roi: RoiBox | None) -> np.ndarray:
     return frame[y:y2, x:x2]
 
 
-def _find_major_motion_window(motion_scores: list[float], fps: float, expected_duration_sec: float) -> tuple[int, int]:
+def _find_major_motion_window(
+    motion_scores: list[float],
+    fps: float,
+    expected_duration_sec: float,
+    tolerance_ratio: float,
+) -> tuple[int, int]:
     if not motion_scores:
         return 0, 0
     approx_len = max(1, int(round(expected_duration_sec * fps)))
-    min_len = max(1, int(round(approx_len * 0.9)))
-    max_len = max(min_len, int(round(approx_len * 1.1)))
+    min_len = max(1, int(round(approx_len * (1.0 - tolerance_ratio))))
+    max_len = max(min_len, int(round(approx_len * (1.0 + tolerance_ratio))))
 
     prefix = [0.0]
     for score in motion_scores:
@@ -690,6 +695,7 @@ def _extract_motion_segment_with_cv2(
         motion_scores=motion_scores,
         fps=fps,
         expected_duration_sec=motion_sampling.normalized_duration_sec(),
+        tolerance_ratio=motion_sampling.normalized_tolerance_ratio(),
     )
 
     motion_dir = output_dir / "motion_segment"
@@ -722,6 +728,115 @@ def _extract_motion_segment_with_cv2(
             break
     cap2.release()
     return f"Motion segment saved {saved} frame(s) in {motion_dir} (frame {start_idx}..{end_idx})."
+
+
+def _run_ffmpeg_repair_attempt(
+    ffmpeg_exe: str,
+    video_path: Path,
+    repaired_path: Path,
+    input_params: list[str],
+    forced_format: str | None = None,
+    decoder_tuning_args: list[str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    cmd: list[str] = [
+        str(ffmpeg_exe),
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        *input_params,
+    ]
+    if forced_format:
+        cmd.extend(["-f", forced_format])
+    if decoder_tuning_args:
+        cmd.extend(decoder_tuning_args)
+    cmd.extend(
+        [
+            "-i",
+            str(video_path),
+            "-map",
+            "0:v:0?",
+            "-an",
+            "-sn",
+            "-dn",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-crf",
+            "28",
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
+            "-y",
+            str(repaired_path),
+        ]
+    )
+    return subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="ignore")
+
+
+def _repair_video_with_ffmpeg(
+    video_path: Path,
+    output_dir: Path,
+    progress_cb: ProgressCallback | None,
+) -> tuple[Path | None, str]:
+    try:
+        imageio_ffmpeg = importlib.import_module("imageio_ffmpeg")
+        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception as exc:
+        return None, f"Repair backend is unavailable: {exc}"
+
+    repaired_dir = output_dir / "__repaired_video_tmp"
+    repaired_dir.mkdir(parents=True, exist_ok=True)
+    repaired_path = repaired_dir / f"{video_path.stem}__repaired.mp4"
+    attempts: list[dict[str, object]] = [{"label": "repair_auto", "forced_format": None, "input_params": FFMPEG_TOLERANT_INPUT_PARAMS}]
+    attempts.extend(
+        {
+            "label": f"repair_forced_{fmt}",
+            "forced_format": fmt,
+            "input_params": FFMPEG_TOLERANT_INPUT_PARAMS,
+        }
+        for fmt in FFMPEG_FORCED_INPUT_FORMATS
+    )
+    attempts.extend(
+        [
+            {
+                "label": "repair_aggressive_h264",
+                "forced_format": "h264",
+                "input_params": FFMPEG_RELAXED_INPUT_PARAMS,
+                "decoder_tuning_args": ["-max_error_rate", "1", "-flags2", "+showall"],
+            },
+            {
+                "label": "repair_aggressive_auto",
+                "forced_format": None,
+                "input_params": FFMPEG_RELAXED_INPUT_PARAMS,
+                "decoder_tuning_args": ["-max_error_rate", "1", "-flags2", "+showall"],
+            },
+        ]
+    )
+    attempt_errors: list[str] = []
+
+    for attempt in attempts:
+        label = str(attempt["label"])
+        if progress_cb:
+            progress_cb(f"[repair] Trying profile: {label}")
+        run = _run_ffmpeg_repair_attempt(
+            ffmpeg_exe=str(ffmpeg_exe),
+            video_path=video_path,
+            repaired_path=repaired_path,
+            input_params=list(attempt["input_params"]),  # type: ignore[arg-type]
+            forced_format=attempt["forced_format"],  # type: ignore[arg-type]
+            decoder_tuning_args=list(attempt.get("decoder_tuning_args", [])),  # type: ignore[arg-type]
+        )
+        if repaired_path.exists() and repaired_path.stat().st_size > 0:
+            return repaired_path, f"Repaired video created with profile {label}."
+
+        stderr = (run.stderr or "").strip()
+        stdout = (run.stdout or "").strip()
+        details = stderr or stdout or f"ffmpeg return code {run.returncode}"
+        attempt_errors.append(f"{label}: {details}")
+
+    return None, f"Repair failed: {' | '.join(attempt_errors)}"
 
 
 def extract_video_frames(
@@ -782,6 +897,38 @@ def extract_video_frames(
         return recovery_result
 
     if progress_cb:
+        progress_cb(f"[repair] Trying video repair transcode for {video_path.name}.")
+    repaired_video_path, repair_message = _repair_video_with_ffmpeg(
+        video_path=video_path,
+        output_dir=output_dir,
+        progress_cb=progress_cb,
+    )
+    if repaired_video_path is not None:
+        repaired_result = _extract_with_cv2(
+            video_path=repaired_video_path,
+            output_dir=output_dir,
+            interval=interval,
+            image_format=image_format,
+            jpg_quality=jpg_quality,
+            roi=roi,
+            motion_sampling=motion_sampling,
+            progress_cb=progress_cb,
+        )
+        if repaired_result is not None and repaired_result.success:
+            ext = ".jpg" if image_format == ImageFormat.JPG else ".png"
+            repaired_files = sorted(output_dir.glob(f"{repaired_video_path.stem}_*{ext}"))
+            for idx, src in enumerate(repaired_files):
+                src.replace(output_dir / f"{video_path.stem}_{idx:06d}{ext}")
+            return VideoExtractionResult(
+                video_path=video_path,
+                output_dir=output_dir,
+                saved_count=repaired_result.saved_count,
+                total_frames_seen=repaired_result.total_frames_seen,
+                success=True,
+                message=f"{repair_message} Completed extraction from repaired stream.",
+            )
+
+    if progress_cb:
         progress_cb(f"[salvage] Trying raw H264 salvage for {video_path.name}.")
     salvage_result = _extract_with_h264_salvage(
         video_path=video_path,
@@ -801,7 +948,7 @@ def extract_video_frames(
         saved_count=0,
         total_frames_seen=0,
         success=False,
-        message=f"{imageio_result.message}\n\n{recovery_result.message}\n\n{salvage_result.message}",
+        message=f"{imageio_result.message}\n\n{recovery_result.message}\n\n{repair_message}\n\n{salvage_result.message}",
     )
 
 
