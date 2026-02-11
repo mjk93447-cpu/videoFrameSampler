@@ -1,6 +1,6 @@
 opencv-python
 numpy
-PySide6
+PySide6-Essentials
 pytest
 pyinstaller
 imageio
