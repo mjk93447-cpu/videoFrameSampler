@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import importlib
+import json
 import math
 import platform
 import shutil
 import subprocess
 import sys
 import tempfile
+from datetime import datetime
 from pathlib import Path
 from typing import Callable, Iterable
 
@@ -55,6 +57,140 @@ CV2_BACKEND_ORDER: tuple[str, ...] = (
     "CAP_MSMF",
     "CAP_FFMPEG",
 )
+
+
+def _truncate_error_block(text: str, max_chars: int = 320) -> str:
+    cleaned = " ".join(str(text or "").replace("\r", "\n").split())
+    if len(cleaned) <= max_chars:
+        return cleaned
+    return cleaned[: max_chars - 3] + "..."
+
+
+def _first_line_or_self(message: str) -> str:
+    raw = str(message or "").strip()
+    if not raw:
+        return "empty message"
+    first_line = raw.splitlines()[0].strip()
+    return first_line or raw
+
+
+def _collect_decode_hints(stage_messages: dict[str, str]) -> list[str]:
+    haystack = "\n".join(stage_messages.values()).lower()
+    hints: list[str] = []
+    if "format avi detected only with low score" in haystack:
+        hints.append("AVI container header/index looks damaged or mislabeled.")
+    if "non-existing pps" in haystack or "decode_slice_header error" in haystack:
+        hints.append("H264 bitstream likely misses required SPS/PPS metadata.")
+    if "moov atom not found" in haystack:
+        hints.append("MP4/MOV metadata atom is missing (container not valid as MP4).")
+    if "ebml header parsing failed" in haystack:
+        hints.append("File does not contain a valid Matroska/WebM header.")
+    if "could not find codec parameters" in haystack:
+        hints.append("Stream parameters are not discoverable from current container headers.")
+    if "container carving found no embedded stream signature" in haystack:
+        hints.append("No secondary embedded container signature was detected in raw bytes.")
+    if "legacy codec bridge failed" in haystack and "unknown error occurred" in haystack:
+        hints.append("AviSynth/DirectShow bridge is unavailable or script parsing failed.")
+
+    dedup: list[str] = []
+    for hint in hints:
+        if hint not in dedup:
+            dedup.append(hint)
+    return dedup
+
+
+def _write_decode_failure_report(
+    output_dir: Path,
+    video_path: Path,
+    stage_messages: dict[str, str],
+) -> Path:
+    report_path = output_dir / "decode_failure_report.txt"
+    file_size = 0
+    header_hex = "n/a"
+    try:
+        raw = video_path.read_bytes()
+        file_size = len(raw)
+        header_hex = raw[:64].hex(" ")
+    except OSError:
+        pass
+
+    lines: list[str] = [
+        f"timestamp: {datetime.now().isoformat(timespec='seconds')}",
+        f"video_path: {video_path}",
+        f"video_exists: {video_path.exists()}",
+        f"video_size_bytes: {file_size}",
+        f"header_hex_64: {header_hex}",
+        "",
+        "stage_summary:",
+    ]
+    for stage, message in stage_messages.items():
+        lines.append(f"- {stage}: {_truncate_error_block(_first_line_or_self(message), 500)}")
+    lines.extend(["", "stage_details:"])
+    for stage, message in stage_messages.items():
+        lines.append(f"[{stage}]")
+        lines.append(str(message or ""))
+        lines.append("")
+
+    report_path.write_text("\n".join(lines), encoding="utf-8")
+    return report_path
+
+
+def _write_decode_failure_report_json(
+    output_dir: Path,
+    video_path: Path,
+    stage_messages: dict[str, str],
+    hints: list[str],
+) -> Path:
+    report_path = output_dir / "decode_failure_report.json"
+    file_size = 0
+    header_hex = "n/a"
+    carved_candidates: list[dict[str, object]] = []
+    try:
+        raw = video_path.read_bytes()
+        file_size = len(raw)
+        header_hex = raw[:64].hex(" ")
+        carved_candidates = [
+            {"offset": offset, "label": label, "extension": ext}
+            for offset, label, ext in _scan_container_offsets(raw)
+        ][:30]
+    except OSError:
+        pass
+
+    payload = {
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "video_path": str(video_path),
+        "video_exists": video_path.exists(),
+        "video_size_bytes": file_size,
+        "header_hex_64": header_hex,
+        "hints": hints,
+        "carving_candidates": carved_candidates,
+        "stage_summary": {stage: _first_line_or_self(message) for stage, message in stage_messages.items()},
+        "stage_details": stage_messages,
+    }
+    report_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    return report_path
+
+
+def _build_compact_failure_message(
+    video_path: Path,
+    stage_messages: dict[str, str],
+    report_path: Path,
+    json_report_path: Path,
+) -> str:
+    stage_order = ("fallback", "recovery", "carving", "repair", "legacy", "salvage")
+    compact_lines = [f"All decode pipelines failed for {video_path.name}."]
+    hints = _collect_decode_hints(stage_messages)
+    if hints:
+        compact_lines.append("Likely causes:")
+        compact_lines.extend(f"- {hint}" for hint in hints[:5])
+
+    compact_lines.append("Stage summary:")
+    for stage in stage_order:
+        if stage in stage_messages:
+            compact_lines.append(f"- {stage}: {_truncate_error_block(_first_line_or_self(stage_messages[stage]))}")
+    compact_lines.append(f"Detailed report: {report_path}")
+    compact_lines.append(f"Structured report: {json_report_path}")
+    return "\n".join(compact_lines)
 
 
 def get_runtime_base_dir() -> Path:
@@ -385,7 +521,7 @@ def _extract_with_imageio_fallback(
     saved_count = 0
 
     try:
-        imageio = importlib.import_module("imageio")
+        imageio_ffmpeg = importlib.import_module("imageio_ffmpeg")
     except Exception as exc:
         return VideoExtractionResult(
             video_path=video_path,
@@ -397,33 +533,40 @@ def _extract_with_imageio_fallback(
         )
 
     try:
-        with imageio.get_reader(
+        reader = imageio_ffmpeg.read_frames(
             str(video_path),
-            format="ffmpeg",
             input_params=FFMPEG_TOLERANT_INPUT_PARAMS,
-        ) as reader:
-            for frame in reader:
-                if frame_index % interval == 0:
-                    # imageio returns RGB arrays; convert to BGR for cv2 encoding.
-                    bgr_frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-                    frame_to_save = _apply_roi(bgr_frame, roi)
-                    filename = f"{video_path.stem}_{saved_count:06d}{ext}"
-                    out_path = output_dir / filename
-                    written = _save_frame(frame_to_save, out_path, image_format, jpg_quality)
-                    if not written:
-                        return VideoExtractionResult(
-                            video_path=video_path,
-                            output_dir=output_dir,
-                            saved_count=saved_count,
-                            total_frames_seen=frame_index,
-                            success=False,
-                            message=f"Failed to save frame: {out_path}",
-                        )
-                    saved_count += 1
-                    if progress_cb and saved_count % 25 == 0:
-                        progress_cb(f"[fallback] Saved {saved_count} frames from {video_path.name}")
+        )
+        meta = next(reader)
+        width, height = meta.get("size", (0, 0))
+        if not width or not height:
+            raise RuntimeError("Fallback ffmpeg pipe did not provide frame size metadata.")
 
+        for frame_bytes in reader:
+            frame_array = np.frombuffer(frame_bytes, dtype=np.uint8)
+            if frame_array.size != width * height * 3:
                 frame_index += 1
+                continue
+            rgb = frame_array.reshape((height, width, 3))
+            if frame_index % interval == 0:
+                bgr_frame = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+                frame_to_save = _apply_roi(bgr_frame, roi)
+                filename = f"{video_path.stem}_{saved_count:06d}{ext}"
+                out_path = output_dir / filename
+                written = _save_frame(frame_to_save, out_path, image_format, jpg_quality)
+                if not written:
+                    return VideoExtractionResult(
+                        video_path=video_path,
+                        output_dir=output_dir,
+                        saved_count=saved_count,
+                        total_frames_seen=frame_index,
+                        success=False,
+                        message=f"Failed to save frame: {out_path}",
+                    )
+                saved_count += 1
+                if progress_cb and saved_count % 25 == 0:
+                    progress_cb(f"[fallback] Saved {saved_count} frames from {video_path.name}")
+            frame_index += 1
     except Exception as exc:
         return VideoExtractionResult(
             video_path=video_path,
@@ -751,9 +894,10 @@ def _extract_with_legacy_codec_bridge(
             message=f"Legacy codec bridge unavailable: {exc}",
         )
 
+    avs_path = str(video_path).replace("\\", "/").replace('"', '\\"')
     profiles: tuple[tuple[str, str], ...] = (
-        ("avisource", f'AviSource(r"{str(video_path)}", audio=false)'),
-        ("directshow", f'DirectShowSource("{str(video_path)}", audio=false, convertfps=true)'),
+        ("avisource", f'AviSource("{avs_path}", audio=false)'),
+        ("directshow", f'DirectShowSource("{avs_path}", audio=false, convertfps=true)'),
     )
     errors: list[str] = []
 
@@ -1186,16 +1330,36 @@ def extract_video_frames(
     if salvage_result.success:
         return salvage_result
 
+    stage_messages = {
+        "fallback": imageio_result.message,
+        "recovery": recovery_result.message,
+        "carving": carving_result.message,
+        "repair": repair_message,
+        "legacy": legacy_result.message,
+        "salvage": salvage_result.message,
+    }
+    report_path = _write_decode_failure_report(
+        output_dir=output_dir,
+        video_path=video_path,
+        stage_messages=stage_messages,
+    )
+    hints = _collect_decode_hints(stage_messages)
+    json_report_path = _write_decode_failure_report_json(
+        output_dir=output_dir,
+        video_path=video_path,
+        stage_messages=stage_messages,
+        hints=hints,
+    )
+    if progress_cb:
+        progress_cb(f"[error] Detailed decode report saved: {report_path}")
+        progress_cb(f"[error] Structured decode report saved: {json_report_path}")
     return VideoExtractionResult(
         video_path=video_path,
         output_dir=output_dir,
         saved_count=0,
         total_frames_seen=0,
         success=False,
-        message=(
-            f"{imageio_result.message}\n\n{recovery_result.message}\n\n{carving_result.message}\n\n{repair_message}\n\n"
-            f"{legacy_result.message}\n\n{salvage_result.message}"
-        ),
+        message=_build_compact_failure_message(video_path, stage_messages, report_path, json_report_path),
     )
 
 
@@ -1260,34 +1424,34 @@ def _probe_cv2_backend(video_path: Path, backend_name: str, backend_id: int | No
 
 def _probe_imageio_reader(video_path: Path) -> dict[str, object]:
     try:
-        imageio = importlib.import_module("imageio")
+        imageio_ffmpeg = importlib.import_module("imageio_ffmpeg")
     except Exception as exc:
         return {"available": False, "error": str(exc)}
 
     try:
-        with imageio.get_reader(
+        reader = imageio_ffmpeg.read_frames(
             str(video_path),
-            format="ffmpeg",
             input_params=FFMPEG_TOLERANT_INPUT_PARAMS,
-        ) as reader:
-            metadata = dict(reader.get_meta_data() or {})
+        )
+        metadata = dict(next(reader) or {})
+        first_frame_ok = False
+        try:
+            frame_bytes = next(reader)
+            first_frame_ok = frame_bytes is not None and len(frame_bytes) > 0
+        except StopIteration:
             first_frame_ok = False
-            for frame in reader:
-                if frame is not None:
-                    first_frame_ok = True
-                break
-            nframes_raw = metadata.get("nframes")
-            try:
-                nframes_value = float(nframes_raw) if nframes_raw is not None else 0.0
-            except (TypeError, ValueError):
-                nframes_value = 0.0
-            return {
-                "available": True,
-                "first_frame_ok": first_frame_ok,
-                "meta_keys": sorted(metadata.keys()),
-                "fps": float(metadata.get("fps") or 0.0),
-                "nframes": int(nframes_value) if math.isfinite(nframes_value) else -1,
-            }
+        nframes_raw = metadata.get("nframes")
+        try:
+            nframes_value = float(nframes_raw) if nframes_raw is not None else 0.0
+        except (TypeError, ValueError):
+            nframes_value = 0.0
+        return {
+            "available": True,
+            "first_frame_ok": first_frame_ok,
+            "meta_keys": sorted(metadata.keys()),
+            "fps": float(metadata.get("fps") or 0.0),
+            "nframes": int(nframes_value) if math.isfinite(nframes_value) else -1,
+        }
     except Exception as exc:
         return {"available": True, "first_frame_ok": False, "error": str(exc)}
 
@@ -1389,7 +1553,7 @@ def collect_decode_diagnostics(video_path: Path, options: ExtractionOptions, rep
         "platform": platform.platform(),
         "python": sys.version.split()[0],
         "cv2_version": cv2.__version__,
-        "imageio_version": _safe_import_version("imageio"),
+        "imageio_version": "removed (using imageio_ffmpeg pipe fallback)",
         "imageio_ffmpeg_version": _safe_import_version("imageio_ffmpeg"),
         "video_path": str(video_path),
         "video_exists": video_path.exists(),

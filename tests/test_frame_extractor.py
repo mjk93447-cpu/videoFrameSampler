@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.metadata
+import json
 import shutil
 import subprocess
 import sys
@@ -143,30 +144,20 @@ def test_fallback_reader_uses_tolerant_ffmpeg_input_params(tmp_path: Path, monke
         def release(self) -> None:
             return None
 
-    class FakeReader:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, exc_type, exc, tb):
-            return False
-
-        def __iter__(self):
+    class FakeImageioFfmpeg:
+        @staticmethod
+        def read_frames(path: str, input_params: list[str]):
+            captured["path"] = path
+            captured["input_params"] = input_params
+            yield {"size": (90, 60), "fps": 30}
             for _ in range(3):
                 frame = np.zeros((60, 90, 3), dtype=np.uint8)
                 frame[:, :, 0] = 120
-                yield frame
-
-    class FakeImageio:
-        @staticmethod
-        def get_reader(path: str, format: str, input_params: list[str]):
-            captured["path"] = path
-            captured["format"] = format
-            captured["input_params"] = input_params
-            return FakeReader()
+                yield frame.tobytes()
 
     def fake_import_module(name: str):
-        if name == "imageio":
-            return FakeImageio
+        if name == "imageio_ffmpeg":
+            return FakeImageioFfmpeg
         return real_import_module(name)
 
     monkeypatch.setattr(frame_extractor.cv2, "VideoCapture", FakeCapture)
@@ -180,7 +171,6 @@ def test_fallback_reader_uses_tolerant_ffmpeg_input_params(tmp_path: Path, monke
     assert result.success is True
     assert result.saved_count == 2
     assert captured["path"] == str(video_path)
-    assert captured["format"] == "ffmpeg"
     assert captured["input_params"] == frame_extractor.FFMPEG_TOLERANT_INPUT_PARAMS
 
 
@@ -203,8 +193,8 @@ def test_fallback_unavailable_does_not_crash(tmp_path: Path, monkeypatch: pytest
             return None
 
     def fake_import_module(name: str):
-        if name == "imageio":
-            raise importlib.metadata.PackageNotFoundError("imageio")
+        if name == "imageio_ffmpeg":
+            raise importlib.metadata.PackageNotFoundError("imageio_ffmpeg")
         return real_import_module(name)
 
     monkeypatch.setattr(frame_extractor.cv2, "VideoCapture", FakeCapture)
@@ -216,7 +206,7 @@ def test_fallback_unavailable_does_not_crash(tmp_path: Path, monkeypatch: pytest
         monkeypatch.setattr(frame_extractor.cv2, "VideoCapture", real_video_capture)
         monkeypatch.setattr(frame_extractor.importlib, "import_module", real_import_module)
 
-    # imageio import failure should not crash extraction flow.
+    # ffmpeg pipe fallback import failure should not crash extraction flow.
     # If recovery ffmpeg backend is available, extraction can still succeed.
     assert isinstance(result.success, bool)
     if result.success:
@@ -255,8 +245,8 @@ def test_extract_video_tries_alternate_cv2_backend_before_fallback(
             return None
 
     def fail_if_import_imageio(name: str):
-        if name == "imageio":
-            raise AssertionError("imageio fallback should not be used when alternate cv2 backend works")
+        if name == "imageio_ffmpeg":
+            raise AssertionError("ffmpeg fallback should not be used when alternate cv2 backend works")
         return real_import_module(name)
 
     monkeypatch.setattr(frame_extractor.cv2, "VideoCapture", FakeCapture)
@@ -666,7 +656,11 @@ def test_legacy_codec_bridge_extracts_frames(tmp_path: Path, monkeypatch: pytest
             return FakeImageioFfmpeg
         return real_import_module(name)
 
+    captured_script = {"text": ""}
+
     def fake_run(cmd, capture_output, text, encoding, errors):
+        script_path = Path(cmd[cmd.index("-i") + 1])
+        captured_script["text"] = script_path.read_text(encoding="utf-8")
         pattern = Path(cmd[-1])
         pattern.parent.mkdir(parents=True, exist_ok=True)
         img = np.zeros((72, 128, 3), dtype=np.uint8)
@@ -695,6 +689,70 @@ def test_legacy_codec_bridge_extracts_frames(tmp_path: Path, monkeypatch: pytest
     assert result.success is True
     assert result.saved_count == 1
     assert "legacy codec bridge" in result.message.lower()
+    assert 'AviSource("' in captured_script["text"]
+    assert 'AviSource(r"' not in captured_script["text"]
+    assert "\\" not in captured_script["text"]
+
+
+def test_extract_video_frames_writes_compact_failure_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _clean_output_dir()
+    video_path = tmp_path / "always_fail.avi"
+    video_path.write_bytes(b"broken")
+    options = ExtractionOptions(interval=2, image_format=ImageFormat.PNG)
+
+    real_cv2_extract = frame_extractor._extract_with_cv2
+    real_imageio_extract = frame_extractor._extract_with_imageio_fallback
+    real_recovery_extract = frame_extractor._extract_with_ffmpeg_recovery
+    real_repair = frame_extractor._repair_video_with_ffmpeg
+    real_legacy_bridge = frame_extractor._extract_with_legacy_codec_bridge
+    real_salvage = frame_extractor._extract_with_h264_salvage
+
+    def fake_cv2(*_args, **_kwargs):
+        return None
+
+    def fake_fail_message(label: str):
+        return VideoExtractionResult(
+            video_path=video_path,
+            output_dir=Path.cwd() / "output" / "always_fail",
+            saved_count=0,
+            total_frames_seen=0,
+            success=False,
+            message=f"{label} failed: sample detailed message",
+        )
+
+    monkeypatch.setattr(frame_extractor, "_extract_with_cv2", fake_cv2)
+    monkeypatch.setattr(frame_extractor, "_extract_with_imageio_fallback", lambda *_a, **_k: fake_fail_message("fallback"))
+    monkeypatch.setattr(frame_extractor, "_extract_with_ffmpeg_recovery", lambda *_a, **_k: fake_fail_message("recovery"))
+    monkeypatch.setattr(frame_extractor, "_repair_video_with_ffmpeg", lambda *_a, **_k: (None, "Repair failed: sample detailed message"))
+    monkeypatch.setattr(frame_extractor, "_extract_with_legacy_codec_bridge", lambda *_a, **_k: fake_fail_message("legacy"))
+    monkeypatch.setattr(frame_extractor, "_extract_with_h264_salvage", lambda *_a, **_k: fake_fail_message("salvage"))
+
+    try:
+        result = frame_extractor.extract_video_frames(video_path, options)
+    finally:
+        monkeypatch.setattr(frame_extractor, "_extract_with_cv2", real_cv2_extract)
+        monkeypatch.setattr(frame_extractor, "_extract_with_imageio_fallback", real_imageio_extract)
+        monkeypatch.setattr(frame_extractor, "_extract_with_ffmpeg_recovery", real_recovery_extract)
+        monkeypatch.setattr(frame_extractor, "_repair_video_with_ffmpeg", real_repair)
+        monkeypatch.setattr(frame_extractor, "_extract_with_legacy_codec_bridge", real_legacy_bridge)
+        monkeypatch.setattr(frame_extractor, "_extract_with_h264_salvage", real_salvage)
+
+    assert result.success is False
+    assert "All decode pipelines failed" in result.message
+    assert "Detailed report:" in result.message
+    assert "Structured report:" in result.message
+    report_path = result.output_dir / "decode_failure_report.txt"
+    json_report_path = result.output_dir / "decode_failure_report.json"
+    assert report_path.exists()
+    assert json_report_path.exists()
+    report_text = report_path.read_text(encoding="utf-8")
+    assert "stage_summary:" in report_text
+    assert "[recovery]" in report_text
+    json_payload = json.loads(json_report_path.read_text(encoding="utf-8"))
+    assert "stage_details" in json_payload
+    assert "hints" in json_payload
 
 
 def test_scan_container_offsets_detects_embedded_signatures() -> None:

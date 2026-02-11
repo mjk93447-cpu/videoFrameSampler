@@ -10,9 +10,7 @@ python -m PyInstaller ^
   --onefile ^
   --windowed ^
   --name videoFrameSampler ^
-  --hidden-import imageio ^
   --hidden-import imageio_ffmpeg ^
-  --copy-metadata imageio ^
   --copy-metadata imageio-ffmpeg ^
   --exclude-module matplotlib ^
   --exclude-module tkinter ^
