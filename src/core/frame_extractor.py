@@ -28,6 +28,17 @@ FFMPEG_TOLERANT_INPUT_PARAMS: list[str] = [
     "200M",
 ]
 
+FFMPEG_RELAXED_INPUT_PARAMS: list[str] = [
+    "-err_detect",
+    "ignore_err",
+    "-fflags",
+    "+genpts+igndts+ignidx",
+    "-analyzeduration",
+    "400M",
+    "-probesize",
+    "400M",
+]
+
 FFMPEG_FORCED_INPUT_FORMATS: tuple[str, ...] = (
     "avi",
     "asf",
@@ -288,17 +299,21 @@ def _run_ffmpeg_recovery_attempt(
     interval: int,
     image_format: ImageFormat,
     jpg_quality: int,
+    input_params: list[str],
     forced_format: str | None = None,
+    decoder_tuning_args: list[str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     cmd: list[str] = [
         str(ffmpeg_exe),
         "-hide_banner",
         "-loglevel",
         "error",
-        *FFMPEG_TOLERANT_INPUT_PARAMS,
+        *input_params,
     ]
     if forced_format:
         cmd.extend(["-f", forced_format])
+    if decoder_tuning_args:
+        cmd.extend(decoder_tuning_args)
     cmd.extend(
         [
             "-i",
@@ -343,12 +358,38 @@ def _extract_with_ffmpeg_recovery(
         )
 
     attempt_errors: list[str] = []
-    attempts: list[str | None] = [None, *FFMPEG_FORCED_INPUT_FORMATS]
+    attempts: list[dict[str, object]] = [{"label": "auto", "forced_format": None, "input_params": FFMPEG_TOLERANT_INPUT_PARAMS}]
+    attempts.extend(
+        {
+            "label": f"forced_{fmt}",
+            "forced_format": fmt,
+            "input_params": FFMPEG_TOLERANT_INPUT_PARAMS,
+        }
+        for fmt in FFMPEG_FORCED_INPUT_FORMATS
+    )
+    attempts.extend(
+        [
+            {
+                "label": "aggressive_h264",
+                "forced_format": "h264",
+                "input_params": FFMPEG_RELAXED_INPUT_PARAMS,
+                "decoder_tuning_args": ["-max_error_rate", "1", "-flags2", "+showall"],
+            },
+            {
+                "label": "aggressive_auto",
+                "forced_format": None,
+                "input_params": FFMPEG_RELAXED_INPUT_PARAMS,
+                "decoder_tuning_args": ["-max_error_rate", "1", "-flags2", "+showall"],
+            },
+        ]
+    )
     success_label = "auto"
 
-    for forced_format in attempts:
-        if progress_cb and forced_format:
-            progress_cb(f"[recovery] Trying forced input format: {forced_format}")
+    for attempt in attempts:
+        forced_format = attempt["forced_format"]  # type: ignore[assignment]
+        label = str(attempt["label"])
+        if progress_cb:
+            progress_cb(f"[recovery] Trying profile: {label}")
 
         run = _run_ffmpeg_recovery_attempt(
             ffmpeg_exe=str(ffmpeg_exe),
@@ -357,19 +398,20 @@ def _extract_with_ffmpeg_recovery(
             interval=interval,
             image_format=image_format,
             jpg_quality=jpg_quality,
+            input_params=list(attempt["input_params"]),  # type: ignore[arg-type]
             forced_format=forced_format,
+            decoder_tuning_args=list(attempt.get("decoder_tuning_args", [])),  # type: ignore[arg-type]
         )
 
         extracted = sorted(tmp_dir.glob(f"frame_*{ext}"))
         if extracted:
-            success_label = forced_format or "auto"
+            success_label = label
             break
 
         stderr = (run.stderr or "").strip()
         stdout = (run.stdout or "").strip()
         details = stderr or stdout or f"ffmpeg return code {run.returncode}"
-        tag = forced_format or "auto"
-        attempt_errors.append(f"{tag}: {details}")
+        attempt_errors.append(f"{label}: {details}")
     else:
         shutil.rmtree(tmp_dir, ignore_errors=True)
         return VideoExtractionResult(
@@ -396,6 +438,100 @@ def _extract_with_ffmpeg_recovery(
         success=True,
         message=f"Completed with recovery ffmpeg decoder ({success_label}).",
     )
+
+
+def _extract_with_h264_salvage(
+    video_path: Path,
+    output_dir: Path,
+    interval: int,
+    image_format: ImageFormat,
+    jpg_quality: int,
+    progress_cb: ProgressCallback | None,
+) -> VideoExtractionResult:
+    ext = ".jpg" if image_format == ImageFormat.JPG else ".png"
+    try:
+        raw = video_path.read_bytes()
+    except OSError as exc:
+        return VideoExtractionResult(
+            video_path=video_path,
+            output_dir=output_dir,
+            saved_count=0,
+            total_frames_seen=0,
+            success=False,
+            message=f"H264 salvage failed to read file: {exc}",
+        )
+
+    start_4 = raw.find(b"\x00\x00\x00\x01")
+    start_3 = raw.find(b"\x00\x00\x01")
+    starts = [pos for pos in (start_4, start_3) if pos >= 0]
+    if not starts:
+        return VideoExtractionResult(
+            video_path=video_path,
+            output_dir=output_dir,
+            saved_count=0,
+            total_frames_seen=0,
+            success=False,
+            message="H264 salvage failed: no Annex-B start code found.",
+        )
+    start = min(starts)
+
+    try:
+        imageio_ffmpeg = importlib.import_module("imageio_ffmpeg")
+        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception as exc:
+        return VideoExtractionResult(
+            video_path=video_path,
+            output_dir=output_dir,
+            saved_count=0,
+            total_frames_seen=0,
+            success=False,
+            message=f"H264 salvage backend is unavailable: {exc}",
+        )
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_dir = Path(tmp)
+        stream_path = tmp_dir / f"{video_path.stem}_salvage.h264"
+        stream_path.write_bytes(raw[start:])
+        pattern_path = tmp_dir / f"salvage_%06d{ext}"
+        run = _run_ffmpeg_recovery_attempt(
+            ffmpeg_exe=str(ffmpeg_exe),
+            video_path=stream_path,
+            pattern_path=pattern_path,
+            interval=interval,
+            image_format=image_format,
+            jpg_quality=jpg_quality,
+            input_params=FFMPEG_RELAXED_INPUT_PARAMS,
+            forced_format="h264",
+            decoder_tuning_args=["-max_error_rate", "1", "-flags2", "+showall"],
+        )
+        extracted = sorted(tmp_dir.glob(f"salvage_*{ext}"))
+        if not extracted:
+            stderr = (run.stderr or "").strip()
+            stdout = (run.stdout or "").strip()
+            details = stderr or stdout or f"ffmpeg return code {run.returncode}"
+            return VideoExtractionResult(
+                video_path=video_path,
+                output_dir=output_dir,
+                saved_count=0,
+                total_frames_seen=0,
+                success=False,
+                message=f"H264 salvage decoder failed: {details}",
+            )
+
+        for idx, src_path in enumerate(extracted):
+            dst_path = output_dir / f"{video_path.stem}_{idx:06d}{ext}"
+            src_path.replace(dst_path)
+            if progress_cb and (idx + 1) % 25 == 0:
+                progress_cb(f"[salvage] Saved {idx + 1} frames from {video_path.name}")
+
+        return VideoExtractionResult(
+            video_path=video_path,
+            output_dir=output_dir,
+            saved_count=len(extracted),
+            total_frames_seen=-1,
+            success=True,
+            message="Completed with raw H264 salvage decoder.",
+        )
 
 
 def extract_video_frames(
@@ -449,13 +585,26 @@ def extract_video_frames(
     if recovery_result.success:
         return recovery_result
 
+    if progress_cb:
+        progress_cb(f"[salvage] Trying raw H264 salvage for {video_path.name}.")
+    salvage_result = _extract_with_h264_salvage(
+        video_path=video_path,
+        output_dir=output_dir,
+        interval=interval,
+        image_format=image_format,
+        jpg_quality=jpg_quality,
+        progress_cb=progress_cb,
+    )
+    if salvage_result.success:
+        return salvage_result
+
     return VideoExtractionResult(
         video_path=video_path,
         output_dir=output_dir,
         saved_count=0,
         total_frames_seen=0,
         success=False,
-        message=f"{imageio_result.message}\n\n{recovery_result.message}",
+        message=f"{imageio_result.message}\n\n{recovery_result.message}\n\n{salvage_result.message}",
     )
 
 
@@ -562,16 +711,44 @@ def _probe_recovery_ffmpeg(video_path: Path) -> dict[str, object]:
     with tempfile.TemporaryDirectory() as tmp:
         sample_out = Path(tmp) / "sample_%06d.jpg"
         runs: list[dict[str, object]] = []
-        for forced_format in (None, *FFMPEG_FORCED_INPUT_FORMATS):
+        probe_attempts: list[dict[str, object]] = [{"label": "auto", "forced_format": None, "input_params": FFMPEG_TOLERANT_INPUT_PARAMS}]
+        probe_attempts.extend(
+            {
+                "label": f"forced_{fmt}",
+                "forced_format": fmt,
+                "input_params": FFMPEG_TOLERANT_INPUT_PARAMS,
+            }
+            for fmt in FFMPEG_FORCED_INPUT_FORMATS
+        )
+        probe_attempts.extend(
+            [
+                {
+                    "label": "aggressive_h264",
+                    "forced_format": "h264",
+                    "input_params": FFMPEG_RELAXED_INPUT_PARAMS,
+                    "decoder_tuning_args": ["-max_error_rate", "1", "-flags2", "+showall"],
+                },
+                {
+                    "label": "aggressive_auto",
+                    "forced_format": None,
+                    "input_params": FFMPEG_RELAXED_INPUT_PARAMS,
+                    "decoder_tuning_args": ["-max_error_rate", "1", "-flags2", "+showall"],
+                },
+            ]
+        )
+        for attempt in probe_attempts:
+            forced_format = attempt["forced_format"]  # type: ignore[assignment]
+            label = str(attempt["label"])
             cmd = [
                 str(ffmpeg_exe),
                 "-hide_banner",
                 "-loglevel",
                 "error",
-                *FFMPEG_TOLERANT_INPUT_PARAMS,
+                *list(attempt["input_params"]),  # type: ignore[arg-type]
             ]
             if forced_format:
                 cmd.extend(["-f", forced_format])
+            cmd.extend(list(attempt.get("decoder_tuning_args", [])))  # type: ignore[arg-type]
             cmd.extend(
                 [
                     "-i",
@@ -588,6 +765,7 @@ def _probe_recovery_ffmpeg(video_path: Path) -> dict[str, object]:
             extracted = list(Path(tmp).glob("sample_*.jpg"))
             runs.append(
                 {
+                    "profile": label,
                     "format": forced_format or "auto",
                     "returncode": run.returncode,
                     "stdout": (run.stdout or "").strip(),

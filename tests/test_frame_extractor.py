@@ -15,7 +15,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from core.frame_extractor import (  # noqa: E402
     CV2_BACKEND_ORDER,
     FFMPEG_FORCED_INPUT_FORMATS,
+    FFMPEG_RELAXED_INPUT_PARAMS,
     _extract_with_ffmpeg_recovery,
+    _extract_with_h264_salvage,
     collect_decode_diagnostics,
     extract_video_frames,
     make_unique_output_dir,
@@ -401,4 +403,110 @@ def test_ffmpeg_recovery_tries_forced_input_formats_when_auto_fails(
     assert "asf" in FFMPEG_FORCED_INPUT_FORMATS
     assert result.success is True
     assert result.saved_count == 1
-    assert "recovery ffmpeg decoder (asf)" in result.message.lower()
+    assert "recovery ffmpeg decoder (forced_asf)" in result.message.lower()
+
+
+def test_ffmpeg_recovery_uses_aggressive_profile_when_needed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    out_dir = tmp_path / "out_aggressive"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    video_path = tmp_path / "corrupt_like.avi"
+    video_path.write_bytes(b"dummy")
+
+    real_import_module = frame_extractor.importlib.import_module
+    real_subprocess_run = frame_extractor.subprocess.run
+
+    class FakeImageioFfmpeg:
+        @staticmethod
+        def get_ffmpeg_exe() -> str:
+            return "ffmpeg"
+
+    def fake_import_module(name: str):
+        if name == "imageio_ffmpeg":
+            return FakeImageioFfmpeg
+        return real_import_module(name)
+
+    def fake_run(cmd, capture_output, text, encoding, errors):
+        pattern = Path(cmd[-1])
+        uses_aggressive = "-max_error_rate" in cmd and "1" in cmd and "-f" in cmd and "h264" in cmd
+        if uses_aggressive:
+            pattern.parent.mkdir(parents=True, exist_ok=True)
+            img = np.zeros((80, 120, 3), dtype=np.uint8)
+            ok, encoded = cv2.imencode(".png", img)
+            assert ok
+            encoded.tofile(str(pattern.parent / "frame_000000.png"))
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+        return subprocess.CompletedProcess(cmd, 1, "", "invalid data")
+
+    monkeypatch.setattr(frame_extractor.importlib, "import_module", fake_import_module)
+    monkeypatch.setattr(frame_extractor.subprocess, "run", fake_run)
+
+    try:
+        result = _extract_with_ffmpeg_recovery(
+            video_path=video_path,
+            output_dir=out_dir,
+            interval=2,
+            image_format=ImageFormat.PNG,
+            jpg_quality=95,
+            progress_cb=None,
+        )
+    finally:
+        monkeypatch.setattr(frame_extractor.importlib, "import_module", real_import_module)
+        monkeypatch.setattr(frame_extractor.subprocess, "run", real_subprocess_run)
+
+    assert "-fflags" in FFMPEG_RELAXED_INPUT_PARAMS
+    assert result.success is True
+    assert result.saved_count == 1
+    assert "aggressive_h264" in result.message.lower()
+
+
+def test_h264_salvage_extracts_frames_from_annexb_payload(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    out_dir = tmp_path / "out_salvage"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    video_path = tmp_path / "wrapped_corrupt.avi"
+    video_path.write_bytes(b"\x11\x22\x33\x44\x00\x00\x00\x01\x67\x64\x00\x1f\x00\x00\x01\x68\xee\x3c\x80")
+
+    real_import_module = frame_extractor.importlib.import_module
+    real_subprocess_run = frame_extractor.subprocess.run
+
+    class FakeImageioFfmpeg:
+        @staticmethod
+        def get_ffmpeg_exe() -> str:
+            return "ffmpeg"
+
+    def fake_import_module(name: str):
+        if name == "imageio_ffmpeg":
+            return FakeImageioFfmpeg
+        return real_import_module(name)
+
+    def fake_run(cmd, capture_output, text, encoding, errors):
+        pattern = Path(cmd[-1])
+        pattern.parent.mkdir(parents=True, exist_ok=True)
+        img = np.zeros((80, 120, 3), dtype=np.uint8)
+        ok, encoded = cv2.imencode(".png", img)
+        assert ok
+        encoded.tofile(str(pattern.parent / "salvage_000000.png"))
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(frame_extractor.importlib, "import_module", fake_import_module)
+    monkeypatch.setattr(frame_extractor.subprocess, "run", fake_run)
+
+    try:
+        result = _extract_with_h264_salvage(
+            video_path=video_path,
+            output_dir=out_dir,
+            interval=2,
+            image_format=ImageFormat.PNG,
+            jpg_quality=95,
+            progress_cb=None,
+        )
+    finally:
+        monkeypatch.setattr(frame_extractor.importlib, "import_module", real_import_module)
+        monkeypatch.setattr(frame_extractor.subprocess, "run", real_subprocess_run)
+
+    assert result.success is True
+    assert result.saved_count == 1
+    assert "raw h264 salvage" in result.message.lower()

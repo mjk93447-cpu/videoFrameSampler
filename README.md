@@ -58,7 +58,8 @@ python src/diagnose_cli.py --video "D:\Non_Documents\SDV_NG_01.avi" --interval 1
 - `probe.cv2`: OpenCV backend(`default`, `dshow`, `msmf`, `ffmpeg`)별 `open/read` 결과
 - `probe.imageio`: fallback ffmpeg 메타/첫 프레임 디코딩 결과
 - `probe.recovery_ffmpeg`: tolerant recovery ffmpeg 1프레임 추출 성공 여부
-- 복구 단계는 자동 입력 감지 실패 시 `avi/asf/mpegts/mov/matroska/h264` 강제 포맷을 순차 시도
+- 복구 단계는 자동 입력 감지 실패 시 `forced_*`/`aggressive_*` 프로필(강제 포맷 + 완화 디코드 옵션)을 순차 시도
+- 위 단계가 모두 실패하면 파일 내부 Annex-B 시그니처를 탐색해 `raw H264 salvage`를 마지막으로 시도
 - `extraction_runs`: 반복 실행별 로그/성공 여부 (버전/환경 편차 재현용)
 
 ## EXE 빌드 (로컬)
