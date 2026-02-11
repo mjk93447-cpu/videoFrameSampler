@@ -655,6 +655,107 @@ def _extract_with_h264_salvage(
         )
 
 
+def _extract_with_legacy_codec_bridge(
+    video_path: Path,
+    output_dir: Path,
+    interval: int,
+    image_format: ImageFormat,
+    jpg_quality: int,
+    roi: RoiBox | None,
+    progress_cb: ProgressCallback | None,
+) -> VideoExtractionResult:
+    ext = ".jpg" if image_format == ImageFormat.JPG else ".png"
+    try:
+        imageio_ffmpeg = importlib.import_module("imageio_ffmpeg")
+        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception as exc:
+        return VideoExtractionResult(
+            video_path=video_path,
+            output_dir=output_dir,
+            saved_count=0,
+            total_frames_seen=0,
+            success=False,
+            message=f"Legacy codec bridge unavailable: {exc}",
+        )
+
+    profiles: tuple[tuple[str, str], ...] = (
+        ("avisource", f'AviSource(r"{str(video_path)}", audio=false)'),
+        ("directshow", f'DirectShowSource("{str(video_path)}", audio=false, convertfps=true)'),
+    )
+    errors: list[str] = []
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_dir = Path(tmp)
+        pattern_path = tmp_dir / f"legacy_%06d{ext}"
+        for name, script_line in profiles:
+            if progress_cb:
+                progress_cb(f"[legacy] Trying codec bridge profile: {name}")
+            script_path = tmp_dir / f"bridge_{name}.avs"
+            script_path.write_text(script_line + "\n", encoding="utf-8")
+
+            cmd: list[str] = [
+                str(ffmpeg_exe),
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "avisynth",
+                "-i",
+                str(script_path),
+                "-vf",
+                f"select=not(mod(n\\,{interval}))",
+                "-vsync",
+                "vfr",
+            ]
+            if image_format == ImageFormat.JPG:
+                cmd.extend(["-q:v", str(_jpg_quality_to_ffmpeg_qscale(jpg_quality))])
+            cmd.extend(["-y", str(pattern_path)])
+            run = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="ignore")
+            extracted = sorted(tmp_dir.glob(f"legacy_*{ext}"))
+            if not extracted:
+                stderr = (run.stderr or "").strip()
+                stdout = (run.stdout or "").strip()
+                details = stderr or stdout or f"ffmpeg return code {run.returncode}"
+                errors.append(f"{name}: {details}")
+                continue
+
+            for idx, src_path in enumerate(extracted):
+                dst_path = output_dir / f"{video_path.stem}_{idx:06d}{ext}"
+                if roi is None:
+                    src_path.replace(dst_path)
+                else:
+                    raw = np.fromfile(str(src_path), dtype=np.uint8)
+                    frame = cv2.imdecode(raw, cv2.IMREAD_COLOR)
+                    if frame is None:
+                        src_path.replace(dst_path)
+                    else:
+                        frame_to_save = _apply_roi(frame, roi)
+                        if _save_frame(frame_to_save, dst_path, image_format, jpg_quality):
+                            src_path.unlink(missing_ok=True)
+                        else:
+                            src_path.replace(dst_path)
+                if progress_cb and (idx + 1) % 25 == 0:
+                    progress_cb(f"[legacy] Saved {idx + 1} frames from {video_path.name}")
+
+            return VideoExtractionResult(
+                video_path=video_path,
+                output_dir=output_dir,
+                saved_count=len(extracted),
+                total_frames_seen=-1,
+                success=True,
+                message=f"Completed with legacy codec bridge ({name}).",
+            )
+
+    return VideoExtractionResult(
+        video_path=video_path,
+        output_dir=output_dir,
+        saved_count=0,
+        total_frames_seen=0,
+        success=False,
+        message=f"Legacy codec bridge failed: {' | '.join(errors)}",
+    )
+
+
 def _extract_motion_segment_with_cv2(
     video_path: Path,
     output_dir: Path,
@@ -929,6 +1030,20 @@ def extract_video_frames(
             )
 
     if progress_cb:
+        progress_cb(f"[legacy] Trying legacy codec bridge for {video_path.name}.")
+    legacy_result = _extract_with_legacy_codec_bridge(
+        video_path=video_path,
+        output_dir=output_dir,
+        interval=interval,
+        image_format=image_format,
+        jpg_quality=jpg_quality,
+        roi=roi,
+        progress_cb=progress_cb,
+    )
+    if legacy_result.success:
+        return legacy_result
+
+    if progress_cb:
         progress_cb(f"[salvage] Trying raw H264 salvage for {video_path.name}.")
     salvage_result = _extract_with_h264_salvage(
         video_path=video_path,
@@ -948,7 +1063,10 @@ def extract_video_frames(
         saved_count=0,
         total_frames_seen=0,
         success=False,
-        message=f"{imageio_result.message}\n\n{recovery_result.message}\n\n{repair_message}\n\n{salvage_result.message}",
+        message=(
+            f"{imageio_result.message}\n\n{recovery_result.message}\n\n{repair_message}\n\n"
+            f"{legacy_result.message}\n\n{salvage_result.message}"
+        ),
     )
 
 

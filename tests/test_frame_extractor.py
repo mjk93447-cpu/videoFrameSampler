@@ -562,6 +562,7 @@ def test_extract_video_frames_uses_repair_pipeline_when_recovery_fails(
     real_imageio_extract = frame_extractor._extract_with_imageio_fallback
     real_recovery_extract = frame_extractor._extract_with_ffmpeg_recovery
     real_repair = frame_extractor._repair_video_with_ffmpeg
+    real_legacy_bridge = frame_extractor._extract_with_legacy_codec_bridge
     real_salvage = frame_extractor._extract_with_h264_salvage
 
     state = {"cv2_calls": 0}
@@ -615,10 +616,21 @@ def test_extract_video_frames_uses_repair_pipeline_when_recovery_fails(
             message="salvage failed",
         )
 
+    def fake_legacy_bridge(*_args, **_kwargs):
+        return VideoExtractionResult(
+            video_path=video_path,
+            output_dir=Path.cwd() / "output" / "broken_input",
+            saved_count=0,
+            total_frames_seen=0,
+            success=False,
+            message="legacy failed",
+        )
+
     monkeypatch.setattr(frame_extractor, "_extract_with_cv2", fake_cv2)
     monkeypatch.setattr(frame_extractor, "_extract_with_imageio_fallback", fake_imageio)
     monkeypatch.setattr(frame_extractor, "_extract_with_ffmpeg_recovery", fake_recovery)
     monkeypatch.setattr(frame_extractor, "_repair_video_with_ffmpeg", fake_repair)
+    monkeypatch.setattr(frame_extractor, "_extract_with_legacy_codec_bridge", fake_legacy_bridge)
     monkeypatch.setattr(frame_extractor, "_extract_with_h264_salvage", fake_salvage)
     try:
         result = frame_extractor.extract_video_frames(video_path, options)
@@ -627,8 +639,59 @@ def test_extract_video_frames_uses_repair_pipeline_when_recovery_fails(
         monkeypatch.setattr(frame_extractor, "_extract_with_imageio_fallback", real_imageio_extract)
         monkeypatch.setattr(frame_extractor, "_extract_with_ffmpeg_recovery", real_recovery_extract)
         monkeypatch.setattr(frame_extractor, "_repair_video_with_ffmpeg", real_repair)
+        monkeypatch.setattr(frame_extractor, "_extract_with_legacy_codec_bridge", real_legacy_bridge)
         monkeypatch.setattr(frame_extractor, "_extract_with_h264_salvage", real_salvage)
 
     assert result.success is True
     assert result.saved_count == 2
     assert "repaired video created" in result.message.lower()
+
+
+def test_legacy_codec_bridge_extracts_frames(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    out_dir = tmp_path / "legacy_out"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    video_path = tmp_path / "legacy_input.avi"
+    video_path.write_bytes(b"dummy")
+
+    real_import_module = frame_extractor.importlib.import_module
+    real_subprocess_run = frame_extractor.subprocess.run
+
+    class FakeImageioFfmpeg:
+        @staticmethod
+        def get_ffmpeg_exe() -> str:
+            return "ffmpeg"
+
+    def fake_import_module(name: str):
+        if name == "imageio_ffmpeg":
+            return FakeImageioFfmpeg
+        return real_import_module(name)
+
+    def fake_run(cmd, capture_output, text, encoding, errors):
+        pattern = Path(cmd[-1])
+        pattern.parent.mkdir(parents=True, exist_ok=True)
+        img = np.zeros((72, 128, 3), dtype=np.uint8)
+        ok, encoded = cv2.imencode(".png", img)
+        assert ok
+        encoded.tofile(str(pattern.parent / "legacy_000000.png"))
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(frame_extractor.importlib, "import_module", fake_import_module)
+    monkeypatch.setattr(frame_extractor.subprocess, "run", fake_run)
+
+    try:
+        result = frame_extractor._extract_with_legacy_codec_bridge(
+            video_path=video_path,
+            output_dir=out_dir,
+            interval=2,
+            image_format=ImageFormat.PNG,
+            jpg_quality=95,
+            roi=None,
+            progress_cb=None,
+        )
+    finally:
+        monkeypatch.setattr(frame_extractor.importlib, "import_module", real_import_module)
+        monkeypatch.setattr(frame_extractor.subprocess, "run", real_subprocess_run)
+
+    assert result.success is True
+    assert result.saved_count == 1
+    assert "legacy codec bridge" in result.message.lower()

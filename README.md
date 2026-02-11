@@ -19,7 +19,7 @@ Windows desktop application for offline video frame extraction with ROI and moti
 - Fast mode:
   - Auto-select JPG and suggest interval from first video metadata.
 - Robust decode fallback pipeline:
-  - OpenCV backends -> imageio ffmpeg -> forced format profiles -> aggressive profiles -> repair transcode -> raw H264 salvage.
+  - OpenCV backends -> imageio ffmpeg -> forced format profiles -> aggressive profiles -> repair transcode -> legacy codec bridge (AviSynth/DirectShow) -> raw H264 salvage.
 
 ## Tech Stack
 
