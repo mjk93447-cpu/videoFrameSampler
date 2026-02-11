@@ -49,10 +49,21 @@ python tests/generate_test_video.py
 python tests/validate_extraction_outputs.py --output-dir output/<video_name>
 ```
 
+버전/코덱 정밀 진단 CLI (Windows legacy decoder 포함):
+
+```bash
+python src/diagnose_cli.py --video "D:\Non_Documents\SDV_NG_01.avi" --interval 1 --format jpg --jpg-quality 95 --repeat 3 --report-json decode_diagnostic_report.json
+```
+
+- `probe.cv2`: OpenCV backend(`default`, `dshow`, `msmf`, `ffmpeg`)별 `open/read` 결과
+- `probe.imageio`: fallback ffmpeg 메타/첫 프레임 디코딩 결과
+- `probe.recovery_ffmpeg`: tolerant recovery ffmpeg 1프레임 추출 성공 여부
+- `extraction_runs`: 반복 실행별 로그/성공 여부 (버전/환경 편차 재현용)
+
 ## EXE 빌드 (로컬)
 
 ```bash
-pyinstaller --noconfirm --onefile --windowed --name videoFrameSampler --hidden-import imageio --hidden-import imageio_ffmpeg --copy-metadata imageio --copy-metadata imageio-ffmpeg src/app.py
+python -m PyInstaller --noconfirm --onefile --windowed --name videoFrameSampler --hidden-import imageio --hidden-import imageio_ffmpeg --copy-metadata imageio --copy-metadata imageio-ffmpeg src/app.py
 ```
 
 결과물:

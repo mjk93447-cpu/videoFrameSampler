@@ -13,7 +13,9 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from core.frame_extractor import (  # noqa: E402
+    CV2_BACKEND_ORDER,
     _extract_with_ffmpeg_recovery,
+    collect_decode_diagnostics,
     extract_video_frames,
     make_unique_output_dir,
     suggest_fast_mode_interval,
@@ -321,3 +323,26 @@ def test_ffmpeg_recovery_extracts_frames_when_fallback_decoder_fails(
     files = sorted(out_dir.glob("*.png"))
     assert len(files) == 3
     assert files[0].name == "broken_like_000000.png"
+
+
+def test_cv2_backend_order_prioritizes_windows_legacy_decoders() -> None:
+    assert CV2_BACKEND_ORDER[0] == "default"
+    assert "CAP_DSHOW" in CV2_BACKEND_ORDER
+    assert "CAP_MSMF" in CV2_BACKEND_ORDER
+    assert CV2_BACKEND_ORDER.index("CAP_DSHOW") < CV2_BACKEND_ORDER.index("CAP_FFMPEG")
+    assert CV2_BACKEND_ORDER.index("CAP_MSMF") < CV2_BACKEND_ORDER.index("CAP_FFMPEG")
+
+
+def test_collect_decode_diagnostics_reports_repeat_runs(tmp_path: Path) -> None:
+    _clean_output_dir()
+    video_path = create_synthetic_video(tmp_path / "diag.mp4", frame_count=10, fourcc="mp4v")
+    options = ExtractionOptions(interval=2, image_format=ImageFormat.PNG)
+
+    report = collect_decode_diagnostics(video_path=video_path, options=options, repeat=2)
+
+    assert "environment" in report
+    assert "probe" in report
+    runs = report["extraction_runs"]
+    assert len(runs) == 2
+    assert all("progress_log" in run for run in runs)
+    assert all("success" in run for run in runs)

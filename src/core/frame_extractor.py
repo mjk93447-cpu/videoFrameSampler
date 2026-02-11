@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import importlib
+import math
+import platform
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Callable, Iterable
 
@@ -24,6 +27,14 @@ FFMPEG_TOLERANT_INPUT_PARAMS: list[str] = [
     "-probesize",
     "200M",
 ]
+
+CV2_BACKEND_ORDER: tuple[str, ...] = (
+    "default",
+    # Prefer legacy Windows system decoders before OpenCV ffmpeg backend.
+    "CAP_DSHOW",
+    "CAP_MSMF",
+    "CAP_FFMPEG",
+)
 
 
 def get_runtime_base_dir() -> Path:
@@ -102,7 +113,9 @@ def _extract_with_cv2(
     ext = ".jpg" if image_format == ImageFormat.JPG else ".png"
 
     backend_candidates: list[tuple[str, int | None]] = [("default", None)]
-    for backend_name in ("CAP_FFMPEG", "CAP_DSHOW", "CAP_MSMF"):
+    for backend_name in CV2_BACKEND_ORDER:
+        if backend_name == "default":
+            continue
         backend_id = getattr(cv2, backend_name, None)
         if isinstance(backend_id, int):
             backend_candidates.append((backend_name.lower(), backend_id))
@@ -116,6 +129,8 @@ def _extract_with_cv2(
         unique_candidates.append((name, backend_id))
 
     for backend_name, backend_id in unique_candidates:
+        if progress_cb:
+            progress_cb(f"[cv2] Trying backend: {backend_name}")
         cap = cv2.VideoCapture(str(video_path)) if backend_id is None else cv2.VideoCapture(str(video_path), backend_id)
         if not cap.isOpened():
             cap.release()
@@ -418,3 +433,162 @@ def extract_videos_sequentially(
             )
         results.append(result)
     return results
+
+
+def _safe_import_version(module_name: str) -> str:
+    try:
+        module = importlib.import_module(module_name)
+        return str(getattr(module, "__version__", "unknown"))
+    except Exception as exc:
+        return f"unavailable: {exc}"
+
+
+def _probe_cv2_backend(video_path: Path, backend_name: str, backend_id: int | None) -> dict[str, object]:
+    cap = cv2.VideoCapture(str(video_path)) if backend_id is None else cv2.VideoCapture(str(video_path), backend_id)
+    opened = bool(cap.isOpened())
+    read_ok = False
+    width = 0
+    height = 0
+    fps = 0.0
+    frame_count = 0.0
+    if opened:
+        fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+        frame_count = float(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0.0)
+        ok, frame = cap.read()
+        read_ok = bool(ok and frame is not None)
+    cap.release()
+    return {
+        "backend": backend_name,
+        "opened": opened,
+        "read_first_frame": read_ok,
+        "fps": fps,
+        "width": width,
+        "height": height,
+        "frame_count": frame_count,
+    }
+
+
+def _probe_imageio_reader(video_path: Path) -> dict[str, object]:
+    try:
+        imageio = importlib.import_module("imageio")
+    except Exception as exc:
+        return {"available": False, "error": str(exc)}
+
+    try:
+        with imageio.get_reader(
+            str(video_path),
+            format="ffmpeg",
+            input_params=FFMPEG_TOLERANT_INPUT_PARAMS,
+        ) as reader:
+            metadata = dict(reader.get_meta_data() or {})
+            first_frame_ok = False
+            for frame in reader:
+                if frame is not None:
+                    first_frame_ok = True
+                break
+            nframes_raw = metadata.get("nframes")
+            try:
+                nframes_value = float(nframes_raw) if nframes_raw is not None else 0.0
+            except (TypeError, ValueError):
+                nframes_value = 0.0
+            return {
+                "available": True,
+                "first_frame_ok": first_frame_ok,
+                "meta_keys": sorted(metadata.keys()),
+                "fps": float(metadata.get("fps") or 0.0),
+                "nframes": int(nframes_value) if math.isfinite(nframes_value) else -1,
+            }
+    except Exception as exc:
+        return {"available": True, "first_frame_ok": False, "error": str(exc)}
+
+
+def _probe_recovery_ffmpeg(video_path: Path) -> dict[str, object]:
+    try:
+        imageio_ffmpeg = importlib.import_module("imageio_ffmpeg")
+        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception as exc:
+        return {"available": False, "error": str(exc)}
+
+    with tempfile.TemporaryDirectory() as tmp:
+        sample_out = Path(tmp) / "sample_%06d.jpg"
+        cmd = [
+            str(ffmpeg_exe),
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            *FFMPEG_TOLERANT_INPUT_PARAMS,
+            "-i",
+            str(video_path),
+            "-frames:v",
+            "1",
+            "-q:v",
+            "2",
+            "-y",
+            str(sample_out),
+        ]
+        run = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="ignore")
+        extracted = list(Path(tmp).glob("sample_*.jpg"))
+        return {
+            "available": True,
+            "returncode": run.returncode,
+            "stdout": (run.stdout or "").strip(),
+            "stderr": (run.stderr or "").strip(),
+            "extracted_first_frame": bool(extracted),
+        }
+
+
+def collect_decode_diagnostics(video_path: Path, options: ExtractionOptions, repeat: int = 1) -> dict[str, object]:
+    video_path = Path(video_path)
+    repeat = max(1, int(repeat))
+
+    backend_candidates: list[tuple[str, int | None]] = [("default", None)]
+    for backend_name in CV2_BACKEND_ORDER:
+        if backend_name == "default":
+            continue
+        backend_id = getattr(cv2, backend_name, None)
+        if isinstance(backend_id, int):
+            backend_candidates.append((backend_name.lower(), backend_id))
+
+    env: dict[str, object] = {
+        "platform": platform.platform(),
+        "python": sys.version.split()[0],
+        "cv2_version": cv2.__version__,
+        "imageio_version": _safe_import_version("imageio"),
+        "imageio_ffmpeg_version": _safe_import_version("imageio_ffmpeg"),
+        "video_path": str(video_path),
+        "video_exists": video_path.exists(),
+        "video_size_bytes": int(video_path.stat().st_size) if video_path.exists() else 0,
+        "cv2_backend_order": [name for name, _ in backend_candidates],
+    }
+
+    cv2_probe = [_probe_cv2_backend(video_path, name, backend_id) for name, backend_id in backend_candidates]
+    imageio_probe = _probe_imageio_reader(video_path)
+    recovery_probe = _probe_recovery_ffmpeg(video_path)
+
+    extraction_runs: list[dict[str, object]] = []
+    for run_idx in range(1, repeat + 1):
+        messages: list[str] = []
+        result = extract_video_frames(video_path, options, progress_cb=messages.append)
+        extraction_runs.append(
+            {
+                "run": run_idx,
+                "success": result.success,
+                "saved_count": result.saved_count,
+                "total_frames_seen": result.total_frames_seen,
+                "message": result.message,
+                "progress_log": messages,
+                "output_dir": str(result.output_dir),
+            }
+        )
+
+    return {
+        "environment": env,
+        "probe": {
+            "cv2": cv2_probe,
+            "imageio": imageio_probe,
+            "recovery_ffmpeg": recovery_probe,
+        },
+        "extraction_runs": extraction_runs,
+    }
