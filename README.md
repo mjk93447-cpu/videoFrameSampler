@@ -22,6 +22,7 @@ Windows desktop application for offline video frame extraction with ROI and moti
   - OpenCV backends -> ffmpeg pipe fallback (`imageio_ffmpeg`) -> forced/aggressive profiles -> embedded container carving -> repair transcode -> legacy codec bridge (AviSynth/DirectShow) -> raw H264 salvage.
 - Enhanced failure logging:
   - On full decode failure, a compact summary is shown in GUI logs.
+  - Full stage summary/details and hint lines are echoed directly in GUI logs.
   - Full stage-by-stage diagnostics are saved to `output/<video_name>/decode_failure_report.txt`.
   - Structured machine-readable diagnostics are saved to `output/<video_name>/decode_failure_report.json`.
 

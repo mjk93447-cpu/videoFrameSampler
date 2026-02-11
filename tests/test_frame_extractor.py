@@ -506,6 +506,145 @@ def test_h264_salvage_extracts_frames_from_annexb_payload(
     assert "raw h264 salvage" in result.message.lower()
 
 
+def test_h264_salvage_tries_multiple_candidate_offsets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    out_dir = tmp_path / "out_salvage_multi"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    video_path = tmp_path / "wrapped_multi.avi"
+    # First NAL is non-SPS (likely bad start), second is SPS.
+    video_path.write_bytes(
+        b"\x00\x00\x00\x01\x61\x11\x22\x33"
+        b"\x00\x00\x00\x01\x67\x64\x00\x1f\x00\x00\x01\x68\xee\x3c\x80"
+    )
+
+    real_import_module = frame_extractor.importlib.import_module
+    real_subprocess_run = frame_extractor.subprocess.run
+
+    class FakeImageioFfmpeg:
+        @staticmethod
+        def get_ffmpeg_exe() -> str:
+            return "ffmpeg"
+
+    def fake_import_module(name: str):
+        if name == "imageio_ffmpeg":
+            return FakeImageioFfmpeg
+        return real_import_module(name)
+
+    seen_prefixes: list[int] = []
+    run_count = {"n": 0}
+
+    def fake_run(cmd, capture_output, text, encoding, errors):
+        input_path = Path(cmd[cmd.index("-i") + 1])
+        payload = input_path.read_bytes()
+        # Record first NAL type for assertion.
+        first_nal_type = int(payload[4] & 0x1F) if len(payload) > 4 and payload[:4] == b"\x00\x00\x00\x01" else -1
+        seen_prefixes.append(first_nal_type)
+
+        pattern = Path(cmd[-1])
+        pattern.parent.mkdir(parents=True, exist_ok=True)
+        run_count["n"] += 1
+        # Force one retry, then succeed on the next candidate.
+        if run_count["n"] == 1:
+            return subprocess.CompletedProcess(cmd, 1, "", "invalid data")
+        img = np.zeros((80, 120, 3), dtype=np.uint8)
+        ok, encoded = cv2.imencode(".png", img)
+        assert ok
+        encoded.tofile(str(pattern.parent / "salvage_000000.png"))
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(frame_extractor.importlib, "import_module", fake_import_module)
+    monkeypatch.setattr(frame_extractor.subprocess, "run", fake_run)
+
+    try:
+        result = frame_extractor._extract_with_h264_salvage(
+            video_path=video_path,
+            output_dir=out_dir,
+            interval=2,
+            image_format=ImageFormat.PNG,
+            jpg_quality=95,
+            roi=None,
+            progress_cb=None,
+        )
+    finally:
+        monkeypatch.setattr(frame_extractor.importlib, "import_module", real_import_module)
+        monkeypatch.setattr(frame_extractor.subprocess, "run", real_subprocess_run)
+
+    assert result.success is True
+    assert result.saved_count == 1
+    # Ensure at least two candidates were tried.
+    assert len(seen_prefixes) >= 2
+
+
+def test_h264_salvage_uses_sps_pps_reconstruction_route(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    out_dir = tmp_path / "out_salvage_rebuild"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    video_path = tmp_path / "wrapped_rebuild.avi"
+    # Include SPS/PPS in payload so reconstruction route can prepend/inject.
+    video_path.write_bytes(
+        b"\x00\x00\x00\x01\x61\x11\x22\x33"
+        b"\x00\x00\x00\x01\x67\x64\x00\x1f"
+        b"\x00\x00\x00\x01\x68\xee\x3c\x80"
+        b"\x00\x00\x00\x01\x65\x88\x99\xaa"
+    )
+
+    real_import_module = frame_extractor.importlib.import_module
+    real_subprocess_run = frame_extractor.subprocess.run
+
+    class FakeImageioFfmpeg:
+        @staticmethod
+        def get_ffmpeg_exe() -> str:
+            return "ffmpeg"
+
+    def fake_import_module(name: str):
+        if name == "imageio_ffmpeg":
+            return FakeImageioFfmpeg
+        return real_import_module(name)
+
+    attempts = {"raw": 0, "rebuild": 0}
+
+    def fake_run(cmd, capture_output, text, encoding, errors):
+        input_path = Path(cmd[cmd.index("-i") + 1])
+        pattern = Path(cmd[-1])
+        pattern.parent.mkdir(parents=True, exist_ok=True)
+
+        if "_salvage_rebuild_" in input_path.name:
+            attempts["rebuild"] += 1
+            img = np.zeros((80, 120, 3), dtype=np.uint8)
+            ok, encoded = cv2.imencode(".png", img)
+            assert ok
+            encoded.tofile(str(pattern.parent / "salvage_000000.png"))
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        attempts["raw"] += 1
+        return subprocess.CompletedProcess(cmd, 1, "", "non-existing PPS")
+
+    monkeypatch.setattr(frame_extractor.importlib, "import_module", fake_import_module)
+    monkeypatch.setattr(frame_extractor.subprocess, "run", fake_run)
+
+    try:
+        result = frame_extractor._extract_with_h264_salvage(
+            video_path=video_path,
+            output_dir=out_dir,
+            interval=2,
+            image_format=ImageFormat.PNG,
+            jpg_quality=95,
+            roi=None,
+            progress_cb=None,
+        )
+    finally:
+        monkeypatch.setattr(frame_extractor.importlib, "import_module", real_import_module)
+        monkeypatch.setattr(frame_extractor.subprocess, "run", real_subprocess_run)
+
+    assert result.success is True
+    assert result.saved_count == 1
+    assert "rebuild_" in result.message
+    assert attempts["raw"] >= 1
+    assert attempts["rebuild"] >= 1
+
+
 def test_extract_video_frames_applies_roi_crop(tmp_path: Path) -> None:
     _clean_output_dir()
     video_path = create_synthetic_video(tmp_path / "roi_source.mp4", frame_count=8, width=200, height=120, fourcc="mp4v")
@@ -753,6 +892,57 @@ def test_extract_video_frames_writes_compact_failure_report(
     json_payload = json.loads(json_report_path.read_text(encoding="utf-8"))
     assert "stage_details" in json_payload
     assert "hints" in json_payload
+
+
+def test_extract_video_frames_emits_full_failure_diagnostics_to_progress_log(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _clean_output_dir()
+    video_path = tmp_path / "always_fail_progress.avi"
+    video_path.write_bytes(b"broken")
+    options = ExtractionOptions(interval=2, image_format=ImageFormat.PNG)
+    progress_log: list[str] = []
+
+    real_cv2_extract = frame_extractor._extract_with_cv2
+    real_imageio_extract = frame_extractor._extract_with_imageio_fallback
+    real_recovery_extract = frame_extractor._extract_with_ffmpeg_recovery
+    real_repair = frame_extractor._repair_video_with_ffmpeg
+    real_legacy_bridge = frame_extractor._extract_with_legacy_codec_bridge
+    real_salvage = frame_extractor._extract_with_h264_salvage
+
+    def fake_cv2(*_args, **_kwargs):
+        return None
+
+    def fake_fail_message(label: str):
+        return VideoExtractionResult(
+            video_path=video_path,
+            output_dir=Path.cwd() / "output" / "always_fail_progress",
+            saved_count=0,
+            total_frames_seen=0,
+            success=False,
+            message=f"{label} failed: sample detailed message",
+        )
+
+    monkeypatch.setattr(frame_extractor, "_extract_with_cv2", fake_cv2)
+    monkeypatch.setattr(frame_extractor, "_extract_with_imageio_fallback", lambda *_a, **_k: fake_fail_message("fallback"))
+    monkeypatch.setattr(frame_extractor, "_extract_with_ffmpeg_recovery", lambda *_a, **_k: fake_fail_message("recovery"))
+    monkeypatch.setattr(frame_extractor, "_repair_video_with_ffmpeg", lambda *_a, **_k: (None, "Repair failed: sample detailed message"))
+    monkeypatch.setattr(frame_extractor, "_extract_with_legacy_codec_bridge", lambda *_a, **_k: fake_fail_message("legacy"))
+    monkeypatch.setattr(frame_extractor, "_extract_with_h264_salvage", lambda *_a, **_k: fake_fail_message("salvage"))
+
+    try:
+        _ = frame_extractor.extract_video_frames(video_path, options, progress_cb=progress_log.append)
+    finally:
+        monkeypatch.setattr(frame_extractor, "_extract_with_cv2", real_cv2_extract)
+        monkeypatch.setattr(frame_extractor, "_extract_with_imageio_fallback", real_imageio_extract)
+        monkeypatch.setattr(frame_extractor, "_extract_with_ffmpeg_recovery", real_recovery_extract)
+        monkeypatch.setattr(frame_extractor, "_repair_video_with_ffmpeg", real_repair)
+        monkeypatch.setattr(frame_extractor, "_extract_with_legacy_codec_bridge", real_legacy_bridge)
+        monkeypatch.setattr(frame_extractor, "_extract_with_h264_salvage", real_salvage)
+
+    assert any("[error][summary] fallback:" in line for line in progress_log)
+    assert any("[error][detail:recovery] begin" in line for line in progress_log)
+    assert any("[error] ----- decode failure diagnostics end -----" in line for line in progress_log)
 
 
 def test_scan_container_offsets_detects_embedded_signatures() -> None:

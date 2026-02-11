@@ -193,6 +193,35 @@ def _build_compact_failure_message(
     return "\n".join(compact_lines)
 
 
+def _emit_failure_diagnostics_to_progress(
+    progress_cb: ProgressCallback | None,
+    stage_messages: dict[str, str],
+    hints: list[str],
+    report_path: Path,
+    json_report_path: Path,
+) -> None:
+    if progress_cb is None:
+        return
+    progress_cb("[error] ----- decode failure diagnostics begin -----")
+    for hint in hints:
+        progress_cb(f"[error][hint] {hint}")
+    for stage, message in stage_messages.items():
+        progress_cb(f"[error][summary] {stage}: {_truncate_error_block(_first_line_or_self(message), 500)}")
+    for stage, message in stage_messages.items():
+        progress_cb(f"[error][detail:{stage}] begin")
+        detail_text = str(message or "")
+        for raw_line in detail_text.splitlines() or [""]:
+            if " | " in raw_line and len(raw_line) > 500:
+                for part in raw_line.split(" | "):
+                    progress_cb(f"[error][detail:{stage}] {part.strip()}")
+            else:
+                progress_cb(f"[error][detail:{stage}] {raw_line}")
+        progress_cb(f"[error][detail:{stage}] end")
+    progress_cb(f"[error] Detailed decode report saved: {report_path}")
+    progress_cb(f"[error] Structured decode report saved: {json_report_path}")
+    progress_cb("[error] ----- decode failure diagnostics end -----")
+
+
 def get_runtime_base_dir() -> Path:
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
@@ -786,10 +815,100 @@ def _extract_with_h264_salvage(
             message=f"H264 salvage failed to read file: {exc}",
         )
 
-    start_4 = raw.find(b"\x00\x00\x00\x01")
-    start_3 = raw.find(b"\x00\x00\x01")
-    starts = [pos for pos in (start_4, start_3) if pos >= 0]
-    if not starts:
+    def _collect_h264_candidate_offsets(payload: bytes, max_candidates: int = 12) -> list[tuple[int, str]]:
+        # Collect multiple Annex-B starts and prioritize offsets that look like SPS/PPS/IDR entry points.
+        candidates: list[tuple[int, str]] = []
+        seen: set[int] = set()
+        i = 0
+        size = len(payload)
+        while i + 5 < size and len(candidates) < max_candidates:
+            start_len = 0
+            if payload[i : i + 4] == b"\x00\x00\x00\x01":
+                start_len = 4
+            elif payload[i : i + 3] == b"\x00\x00\x01":
+                start_len = 3
+            if start_len == 0:
+                i += 1
+                continue
+            nal_header_idx = i + start_len
+            if nal_header_idx >= size:
+                break
+            nal_type = int(payload[nal_header_idx] & 0x1F)
+            if i not in seen:
+                seen.add(i)
+                if nal_type == 7:
+                    candidates.append((i, "sps"))
+                elif nal_type == 8:
+                    candidates.append((i, "pps"))
+                elif nal_type == 5:
+                    candidates.append((i, "idr"))
+                elif nal_type == 1:
+                    candidates.append((i, "slice"))
+                else:
+                    candidates.append((i, f"nal_{nal_type}"))
+            i = nal_header_idx + 1
+
+        # Prefer likely decoder-bootstrap points first.
+        priority = {"sps": 0, "pps": 1, "idr": 2, "slice": 3}
+        return sorted(candidates, key=lambda item: (priority.get(item[1], 9), item[0]))[:max_candidates]
+
+    def _iter_annexb_units(payload: bytes) -> list[tuple[int, bytes]]:
+        markers: list[tuple[int, int]] = []
+        i = 0
+        end = len(payload)
+        while i + 3 < end:
+            marker_len = 0
+            if payload[i : i + 4] == b"\x00\x00\x00\x01":
+                marker_len = 4
+            elif payload[i : i + 3] == b"\x00\x00\x01":
+                marker_len = 3
+            if marker_len:
+                markers.append((i, marker_len))
+                i += marker_len
+            else:
+                i += 1
+
+        units: list[tuple[int, bytes]] = []
+        for idx, (start, marker_len) in enumerate(markers):
+            nal_start = start + marker_len
+            next_start = markers[idx + 1][0] if idx + 1 < len(markers) else end
+            nal = payload[nal_start:next_start]
+            if not nal:
+                continue
+            units.append((int(nal[0] & 0x1F), bytes(nal)))
+        return units
+
+    def _extract_sps_pps(payload: bytes) -> tuple[bytes | None, bytes | None]:
+        sps: bytes | None = None
+        pps: bytes | None = None
+        for nal_type, nal in _iter_annexb_units(payload):
+            if nal_type == 7 and sps is None:
+                sps = nal
+            elif nal_type == 8 and pps is None:
+                pps = nal
+            if sps is not None and pps is not None:
+                break
+        return sps, pps
+
+    def _rebuild_h264_with_parameter_sets(payload: bytes, sps: bytes, pps: bytes) -> bytes:
+        units = _iter_annexb_units(payload)
+        if not units:
+            return b""
+        start_code = b"\x00\x00\x00\x01"
+        rebuilt = bytearray()
+        # Bootstrap decoder context once at stream head.
+        rebuilt.extend(start_code + sps)
+        rebuilt.extend(start_code + pps)
+        for nal_type, nal in units:
+            if nal_type == 5:
+                # Re-announce SPS/PPS before IDR frames for damaged streams.
+                rebuilt.extend(start_code + sps)
+                rebuilt.extend(start_code + pps)
+            rebuilt.extend(start_code + nal)
+        return bytes(rebuilt)
+
+    candidates = _collect_h264_candidate_offsets(raw)
+    if not candidates:
         return VideoExtractionResult(
             video_path=video_path,
             output_dir=output_dir,
@@ -798,7 +917,6 @@ def _extract_with_h264_salvage(
             success=False,
             message="H264 salvage failed: no Annex-B start code found.",
         )
-    start = min(starts)
 
     try:
         imageio_ffmpeg = importlib.import_module("imageio_ffmpeg")
@@ -813,34 +931,96 @@ def _extract_with_h264_salvage(
             message=f"H264 salvage backend is unavailable: {exc}",
         )
 
+    sps, pps = _extract_sps_pps(raw)
+    if progress_cb:
+        progress_cb(
+            "[salvage] SPS/PPS scan: "
+            + ("found SPS" if sps is not None else "no SPS")
+            + ", "
+            + ("found PPS" if pps is not None else "no PPS")
+        )
+
     with tempfile.TemporaryDirectory() as tmp:
         tmp_dir = Path(tmp)
-        stream_path = tmp_dir / f"{video_path.stem}_salvage.h264"
-        stream_path.write_bytes(raw[start:])
         pattern_path = tmp_dir / f"salvage_%06d{ext}"
-        run = _run_ffmpeg_recovery_attempt(
-            ffmpeg_exe=str(ffmpeg_exe),
-            video_path=stream_path,
-            pattern_path=pattern_path,
-            interval=interval,
-            image_format=image_format,
-            jpg_quality=jpg_quality,
-            input_params=FFMPEG_RELAXED_INPUT_PARAMS,
-            forced_format="h264",
-            decoder_tuning_args=["-max_error_rate", "1", "-flags2", "+showall"],
-        )
-        extracted = sorted(tmp_dir.glob(f"salvage_*{ext}"))
-        if not extracted:
+        attempt_errors: list[str] = []
+        extracted: list[Path] = []
+        success_mode = "raw"
+
+        for candidate_offset, candidate_label in candidates:
+            if progress_cb:
+                progress_cb(
+                    f"[salvage] Trying candidate offset {candidate_offset} ({candidate_label})."
+                )
+            for stale in tmp_dir.glob(f"salvage_*{ext}"):
+                stale.unlink(missing_ok=True)
+
+            stream_path = tmp_dir / f"{video_path.stem}_salvage_{candidate_offset}.h264"
+            stream_path.write_bytes(raw[candidate_offset:])
+
+            run = _run_ffmpeg_recovery_attempt(
+                ffmpeg_exe=str(ffmpeg_exe),
+                video_path=stream_path,
+                pattern_path=pattern_path,
+                interval=interval,
+                image_format=image_format,
+                jpg_quality=jpg_quality,
+                input_params=FFMPEG_RELAXED_INPUT_PARAMS,
+                forced_format="h264",
+                decoder_tuning_args=["-max_error_rate", "1", "-flags2", "+showall"],
+            )
+            extracted = sorted(tmp_dir.glob(f"salvage_*{ext}"))
+            if extracted:
+                success_mode = f"raw_{candidate_label}@{candidate_offset}"
+                break
+
             stderr = (run.stderr or "").strip()
             stdout = (run.stdout or "").strip()
             details = stderr or stdout or f"ffmpeg return code {run.returncode}"
+            attempt_errors.append(f"{candidate_label}@{candidate_offset}: {details}")
+
+            # Immediate reconstruction route: prepend/inject SPS/PPS if available.
+            if sps is not None and pps is not None:
+                if progress_cb:
+                    progress_cb(
+                        f"[salvage] Trying SPS/PPS reconstruction for offset {candidate_offset} ({candidate_label})."
+                    )
+                rebuilt = _rebuild_h264_with_parameter_sets(raw[candidate_offset:], sps, pps)
+                if rebuilt:
+                    for stale in tmp_dir.glob(f"salvage_*{ext}"):
+                        stale.unlink(missing_ok=True)
+                    rebuilt_path = tmp_dir / f"{video_path.stem}_salvage_rebuild_{candidate_offset}.h264"
+                    rebuilt_path.write_bytes(rebuilt)
+                    rebuilt_run = _run_ffmpeg_recovery_attempt(
+                        ffmpeg_exe=str(ffmpeg_exe),
+                        video_path=rebuilt_path,
+                        pattern_path=pattern_path,
+                        interval=interval,
+                        image_format=image_format,
+                        jpg_quality=jpg_quality,
+                        input_params=FFMPEG_RELAXED_INPUT_PARAMS,
+                        forced_format="h264",
+                        decoder_tuning_args=["-max_error_rate", "1", "-flags2", "+showall"],
+                    )
+                    extracted = sorted(tmp_dir.glob(f"salvage_*{ext}"))
+                    if extracted:
+                        success_mode = f"rebuild_{candidate_label}@{candidate_offset}"
+                        break
+                    rebuilt_stderr = (rebuilt_run.stderr or "").strip()
+                    rebuilt_stdout = (rebuilt_run.stdout or "").strip()
+                    rebuilt_details = rebuilt_stderr or rebuilt_stdout or f"ffmpeg return code {rebuilt_run.returncode}"
+                    attempt_errors.append(
+                        f"rebuild_{candidate_label}@{candidate_offset}: {rebuilt_details}"
+                    )
+
+        if not extracted:
             return VideoExtractionResult(
                 video_path=video_path,
                 output_dir=output_dir,
                 saved_count=0,
                 total_frames_seen=0,
                 success=False,
-                message=f"H264 salvage decoder failed: {details}",
+                message=f"H264 salvage decoder failed: {' | '.join(attempt_errors)}",
             )
 
         for idx, src_path in enumerate(extracted):
@@ -867,7 +1047,7 @@ def _extract_with_h264_salvage(
             saved_count=len(extracted),
             total_frames_seen=-1,
             success=True,
-            message="Completed with raw H264 salvage decoder.",
+            message=f"Completed with raw H264 salvage decoder ({success_mode}).",
         )
 
 
@@ -1350,9 +1530,13 @@ def extract_video_frames(
         stage_messages=stage_messages,
         hints=hints,
     )
-    if progress_cb:
-        progress_cb(f"[error] Detailed decode report saved: {report_path}")
-        progress_cb(f"[error] Structured decode report saved: {json_report_path}")
+    _emit_failure_diagnostics_to_progress(
+        progress_cb=progress_cb,
+        stage_messages=stage_messages,
+        hints=hints,
+        report_path=report_path,
+        json_report_path=json_report_path,
+    )
     return VideoExtractionResult(
         video_path=video_path,
         output_dir=output_dir,
