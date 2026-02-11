@@ -24,7 +24,7 @@ from core.frame_extractor import (  # noqa: E402
     suggest_fast_mode_interval,
 )
 import core.frame_extractor as frame_extractor  # noqa: E402
-from core.models import ExtractionOptions, ImageFormat  # noqa: E402
+from core.models import ExtractionOptions, ImageFormat, MotionSamplingOptions, RoiBox  # noqa: E402
 from tests.generate_test_video import create_synthetic_video  # noqa: E402
 
 
@@ -315,6 +315,7 @@ def test_ffmpeg_recovery_extracts_frames_when_fallback_decoder_fails(
             interval=2,
             image_format=ImageFormat.PNG,
             jpg_quality=95,
+            roi=None,
             progress_cb=None,
         )
     finally:
@@ -394,6 +395,7 @@ def test_ffmpeg_recovery_tries_forced_input_formats_when_auto_fails(
             interval=2,
             image_format=ImageFormat.PNG,
             jpg_quality=95,
+            roi=None,
             progress_cb=None,
         )
     finally:
@@ -449,6 +451,7 @@ def test_ffmpeg_recovery_uses_aggressive_profile_when_needed(
             interval=2,
             image_format=ImageFormat.PNG,
             jpg_quality=95,
+            roi=None,
             progress_cb=None,
         )
     finally:
@@ -501,6 +504,7 @@ def test_h264_salvage_extracts_frames_from_annexb_payload(
             interval=2,
             image_format=ImageFormat.PNG,
             jpg_quality=95,
+            roi=None,
             progress_cb=None,
         )
     finally:
@@ -510,3 +514,37 @@ def test_h264_salvage_extracts_frames_from_annexb_payload(
     assert result.success is True
     assert result.saved_count == 1
     assert "raw h264 salvage" in result.message.lower()
+
+
+def test_extract_video_frames_applies_roi_crop(tmp_path: Path) -> None:
+    _clean_output_dir()
+    video_path = create_synthetic_video(tmp_path / "roi_source.mp4", frame_count=8, width=200, height=120, fourcc="mp4v")
+    options = ExtractionOptions(
+        interval=2,
+        image_format=ImageFormat.PNG,
+        roi=RoiBox(x=20, y=10, width=80, height=50),
+    )
+    result = extract_video_frames(video_path, options)
+    assert result.success is True
+    files = sorted(result.output_dir.glob("*.png"))
+    assert files
+    img = _read_image_unicode_safe(files[0])
+    assert img is not None
+    assert img.shape[1] == 80
+    assert img.shape[0] == 50
+
+
+def test_extract_video_frames_saves_motion_segment(tmp_path: Path) -> None:
+    _clean_output_dir()
+    video_path = create_synthetic_video(tmp_path / "motion_source.mp4", frame_count=36, width=240, height=140, fps=12, fourcc="mp4v")
+    options = ExtractionOptions(
+        interval=3,
+        image_format=ImageFormat.JPG,
+        motion_sampling=MotionSamplingOptions(enabled=True, expected_duration_sec=1.5),
+    )
+    result = extract_video_frames(video_path, options)
+    assert result.success is True
+    motion_dir = result.output_dir / "motion_segment"
+    files = sorted(motion_dir.glob("*.jpg"))
+    assert files
+    assert len(files) >= 1

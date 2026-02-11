@@ -13,7 +13,7 @@ from typing import Callable, Iterable
 import cv2
 import numpy as np
 
-from core.models import ExtractionOptions, ImageFormat, VideoExtractionResult
+from core.models import ExtractionOptions, ImageFormat, MotionSamplingOptions, RoiBox, VideoExtractionResult
 
 ProgressCallback = Callable[[str], None]
 
@@ -96,6 +96,31 @@ def suggest_fast_mode_interval(video_path: Path) -> int:
     return 2
 
 
+def load_first_frame_preview(video_path: Path) -> np.ndarray | None:
+    candidates: list[int | None] = [None]
+    for backend_name in CV2_BACKEND_ORDER:
+        if backend_name == "default":
+            continue
+        backend_id = getattr(cv2, backend_name, None)
+        if isinstance(backend_id, int):
+            candidates.append(backend_id)
+
+    seen: set[int | None] = set()
+    for backend_id in candidates:
+        if backend_id in seen:
+            continue
+        seen.add(backend_id)
+        cap = cv2.VideoCapture(str(video_path)) if backend_id is None else cv2.VideoCapture(str(video_path), backend_id)
+        if not cap.isOpened():
+            cap.release()
+            continue
+        ok, frame = cap.read()
+        cap.release()
+        if ok and frame is not None:
+            return frame
+    return None
+
+
 def _save_frame(
     frame,
     out_path: Path,
@@ -122,12 +147,60 @@ def _save_frame(
         return False
 
 
+def _clamp_roi(frame_shape: tuple[int, ...], roi: RoiBox | None) -> tuple[int, int, int, int] | None:
+    if roi is None:
+        return None
+    normalized = roi.normalized()
+    h, w = frame_shape[:2]
+    x = min(max(0, normalized.x), max(0, w - 1))
+    y = min(max(0, normalized.y), max(0, h - 1))
+    x2 = min(w, x + normalized.width)
+    y2 = min(h, y + normalized.height)
+    if x2 <= x or y2 <= y:
+        return None
+    return x, y, x2, y2
+
+
+def _apply_roi(frame: np.ndarray, roi: RoiBox | None) -> np.ndarray:
+    bounds = _clamp_roi(frame.shape, roi)
+    if bounds is None:
+        return frame
+    x, y, x2, y2 = bounds
+    return frame[y:y2, x:x2]
+
+
+def _find_major_motion_window(motion_scores: list[float], fps: float, expected_duration_sec: float) -> tuple[int, int]:
+    if not motion_scores:
+        return 0, 0
+    approx_len = max(1, int(round(expected_duration_sec * fps)))
+    min_len = max(1, int(round(approx_len * 0.9)))
+    max_len = max(min_len, int(round(approx_len * 1.1)))
+
+    prefix = [0.0]
+    for score in motion_scores:
+        prefix.append(prefix[-1] + score)
+
+    best_start = 0
+    best_len = min_len
+    best_sum = -1.0
+    total = len(motion_scores)
+    for length in range(min_len, min(max_len, total) + 1):
+        for start in range(0, total - length + 1):
+            current = prefix[start + length] - prefix[start]
+            if current > best_sum:
+                best_sum = current
+                best_start = start
+                best_len = length
+    return best_start, min(total - 1, best_start + best_len - 1)
+
 def _extract_with_cv2(
     video_path: Path,
     output_dir: Path,
     interval: int,
     image_format: ImageFormat,
     jpg_quality: int,
+    roi: RoiBox | None,
+    motion_sampling: MotionSamplingOptions | None,
     progress_cb: ProgressCallback | None,
 ) -> VideoExtractionResult | None:
     ext = ".jpg" if image_format == ImageFormat.JPG else ".png"
@@ -166,9 +239,10 @@ def _extract_with_cv2(
                 break
 
             if frame_index % interval == 0:
+                frame_to_save = _apply_roi(frame, roi)
                 filename = f"{video_path.stem}_{saved_count:06d}{ext}"
                 out_path = output_dir / filename
-                written = _save_frame(frame, out_path, image_format, jpg_quality)
+                written = _save_frame(frame_to_save, out_path, image_format, jpg_quality)
                 if not written:
                     failure_message = f"Failed to save frame: {out_path}"
                     break
@@ -193,13 +267,27 @@ def _extract_with_cv2(
         if saved_count == 0 and frame_index == 0:
             continue
 
+        message = f"Completed with OpenCV backend: {backend_name}."
+        if motion_sampling and motion_sampling.enabled:
+            motion_result = _extract_motion_segment_with_cv2(
+                video_path=video_path,
+                output_dir=output_dir,
+                image_format=image_format,
+                jpg_quality=jpg_quality,
+                roi=roi,
+                motion_sampling=motion_sampling,
+                backend_id=backend_id,
+                progress_cb=progress_cb,
+            )
+            message = f"{message} {motion_result}"
+
         return VideoExtractionResult(
             video_path=video_path,
             output_dir=output_dir,
             saved_count=saved_count,
             total_frames_seen=frame_index,
             success=True,
-            message=f"Completed with OpenCV backend: {backend_name}.",
+            message=message,
         )
 
     return None
@@ -211,6 +299,7 @@ def _extract_with_imageio_fallback(
     interval: int,
     image_format: ImageFormat,
     jpg_quality: int,
+    roi: RoiBox | None,
     progress_cb: ProgressCallback | None,
 ) -> VideoExtractionResult:
     ext = ".jpg" if image_format == ImageFormat.JPG else ".png"
@@ -239,9 +328,10 @@ def _extract_with_imageio_fallback(
                 if frame_index % interval == 0:
                     # imageio returns RGB arrays; convert to BGR for cv2 encoding.
                     bgr_frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                    frame_to_save = _apply_roi(bgr_frame, roi)
                     filename = f"{video_path.stem}_{saved_count:06d}{ext}"
                     out_path = output_dir / filename
-                    written = _save_frame(bgr_frame, out_path, image_format, jpg_quality)
+                    written = _save_frame(frame_to_save, out_path, image_format, jpg_quality)
                     if not written:
                         return VideoExtractionResult(
                             video_path=video_path,
@@ -336,6 +426,7 @@ def _extract_with_ffmpeg_recovery(
     interval: int,
     image_format: ImageFormat,
     jpg_quality: int,
+    roi: RoiBox | None,
     progress_cb: ProgressCallback | None,
 ) -> VideoExtractionResult:
     ext = ".jpg" if image_format == ImageFormat.JPG else ".png"
@@ -425,7 +516,19 @@ def _extract_with_ffmpeg_recovery(
 
     for idx, src_path in enumerate(extracted):
         dst_path = output_dir / f"{video_path.stem}_{idx:06d}{ext}"
-        src_path.replace(dst_path)
+        if roi is None:
+            src_path.replace(dst_path)
+        else:
+            raw = np.fromfile(str(src_path), dtype=np.uint8)
+            frame = cv2.imdecode(raw, cv2.IMREAD_COLOR)
+            if frame is None:
+                src_path.replace(dst_path)
+            else:
+                frame_to_save = _apply_roi(frame, roi)
+                if _save_frame(frame_to_save, dst_path, image_format, jpg_quality):
+                    src_path.unlink(missing_ok=True)
+                else:
+                    src_path.replace(dst_path)
         if progress_cb and (idx + 1) % 25 == 0:
             progress_cb(f"[recovery] Saved {idx + 1} frames from {video_path.name}")
 
@@ -446,6 +549,7 @@ def _extract_with_h264_salvage(
     interval: int,
     image_format: ImageFormat,
     jpg_quality: int,
+    roi: RoiBox | None,
     progress_cb: ProgressCallback | None,
 ) -> VideoExtractionResult:
     ext = ".jpg" if image_format == ImageFormat.JPG else ".png"
@@ -520,7 +624,19 @@ def _extract_with_h264_salvage(
 
         for idx, src_path in enumerate(extracted):
             dst_path = output_dir / f"{video_path.stem}_{idx:06d}{ext}"
-            src_path.replace(dst_path)
+            if roi is None:
+                src_path.replace(dst_path)
+            else:
+                raw_img = np.fromfile(str(src_path), dtype=np.uint8)
+                frame = cv2.imdecode(raw_img, cv2.IMREAD_COLOR)
+                if frame is None:
+                    src_path.replace(dst_path)
+                else:
+                    frame_to_save = _apply_roi(frame, roi)
+                    if _save_frame(frame_to_save, dst_path, image_format, jpg_quality):
+                        src_path.unlink(missing_ok=True)
+                    else:
+                        src_path.replace(dst_path)
             if progress_cb and (idx + 1) % 25 == 0:
                 progress_cb(f"[salvage] Saved {idx + 1} frames from {video_path.name}")
 
@@ -532,6 +648,80 @@ def _extract_with_h264_salvage(
             success=True,
             message="Completed with raw H264 salvage decoder.",
         )
+
+
+def _extract_motion_segment_with_cv2(
+    video_path: Path,
+    output_dir: Path,
+    image_format: ImageFormat,
+    jpg_quality: int,
+    roi: RoiBox | None,
+    motion_sampling: MotionSamplingOptions,
+    backend_id: int | None,
+    progress_cb: ProgressCallback | None,
+) -> str:
+    cap = cv2.VideoCapture(str(video_path)) if backend_id is None else cv2.VideoCapture(str(video_path), backend_id)
+    if not cap.isOpened():
+        cap.release()
+        return "Motion sampling skipped: decode pass unavailable."
+
+    fps = float(cap.get(cv2.CAP_PROP_FPS) or 30.0)
+    prev_gray: np.ndarray | None = None
+    motion_scores: list[float] = []
+    frame_count = 0
+
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        roi_frame = _apply_roi(frame, roi)
+        gray = cv2.cvtColor(roi_frame, cv2.COLOR_BGR2GRAY)
+        if prev_gray is not None:
+            diff = cv2.absdiff(gray, prev_gray)
+            motion_scores.append(float(np.mean(diff)))
+        prev_gray = gray
+        frame_count += 1
+    cap.release()
+
+    if frame_count <= 1 or not motion_scores:
+        return "Motion sampling skipped: insufficient frames."
+
+    start_idx, end_idx = _find_major_motion_window(
+        motion_scores=motion_scores,
+        fps=fps,
+        expected_duration_sec=motion_sampling.normalized_duration_sec(),
+    )
+
+    motion_dir = output_dir / "motion_segment"
+    motion_dir.mkdir(parents=True, exist_ok=True)
+    ext = ".jpg" if image_format == ImageFormat.JPG else ".png"
+
+    cap2 = cv2.VideoCapture(str(video_path)) if backend_id is None else cv2.VideoCapture(str(video_path), backend_id)
+    if not cap2.isOpened():
+        cap2.release()
+        return "Motion sampling skipped: write pass unavailable."
+
+    idx = 0
+    saved = 0
+    while True:
+        ok, frame = cap2.read()
+        if not ok:
+            break
+        if start_idx <= idx <= end_idx:
+            roi_frame = _apply_roi(frame, roi)
+            filename = f"{video_path.stem}_motion_{saved:06d}{ext}"
+            out_path = motion_dir / filename
+            if not _save_frame(roi_frame, out_path, image_format, jpg_quality):
+                cap2.release()
+                return f"Motion sampling stopped: failed to save {out_path.name}."
+            saved += 1
+            if progress_cb and saved % 25 == 0:
+                progress_cb(f"[motion] Saved {saved} frames from {video_path.name}")
+        idx += 1
+        if idx > end_idx:
+            break
+    cap2.release()
+    return f"Motion segment saved {saved} frame(s) in {motion_dir} (frame {start_idx}..{end_idx})."
 
 
 def extract_video_frames(
@@ -547,6 +737,8 @@ def extract_video_frames(
     interval = options.normalized_interval()
     image_format = options.image_format
     jpg_quality = options.normalized_jpg_quality()
+    roi = options.roi.normalized() if options.roi is not None else None
+    motion_sampling = options.motion_sampling or MotionSamplingOptions()
 
     cv2_result = _extract_with_cv2(
         video_path=video_path,
@@ -554,6 +746,8 @@ def extract_video_frames(
         interval=interval,
         image_format=image_format,
         jpg_quality=jpg_quality,
+        roi=roi,
+        motion_sampling=motion_sampling,
         progress_cb=progress_cb,
     )
     if cv2_result is not None:
@@ -567,6 +761,7 @@ def extract_video_frames(
         interval=interval,
         image_format=image_format,
         jpg_quality=jpg_quality,
+        roi=roi,
         progress_cb=progress_cb,
     )
     if imageio_result.success:
@@ -580,6 +775,7 @@ def extract_video_frames(
         interval=interval,
         image_format=image_format,
         jpg_quality=jpg_quality,
+        roi=roi,
         progress_cb=progress_cb,
     )
     if recovery_result.success:
@@ -593,6 +789,7 @@ def extract_video_frames(
         interval=interval,
         image_format=image_format,
         jpg_quality=jpg_quality,
+        roi=roi,
         progress_cb=progress_cb,
     )
     if salvage_result.success:
